@@ -1,0 +1,29 @@
+# Environments
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Data & experiment outputs (never commit datasets or weights)
+data/
+datasets/
+checkpoints/
+weights/
+runs/
+outputs/
+wandb/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.engine
+
+# OS / editor
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
+
+# Temp
+*.tmp
+*.log
