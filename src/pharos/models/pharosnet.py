@@ -102,11 +102,15 @@ class PharosNet(nn.Module):
 
     # -- helpers --------------------------------------------------------------
     def _lowres(self, frame: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Resize long side to `lowres`, then pad to a multiple of 8 (3 downsamples)."""
-        _, _, h, w = frame.shape
+        """Resize long side to `lowres`, then pad to a multiple of 8 (3 downsamples).
+
+        Shapes go through int() so the ONNX tracer constant-folds them at a fixed
+        export resolution (traced .shape entries are Tensors; round() breaks).
+        """
+        h, w = int(frame.shape[-2]), int(frame.shape[-1])
         scale = self.lowres / max(h, w)
-        h0 = max(1, round(h * scale))
-        w0 = max(1, round(w * scale))
+        h0 = max(1, int(h * scale + 0.5))
+        w0 = max(1, int(w * scale + 0.5))
         lr = F.interpolate(frame, size=(h0, w0), mode="bilinear", align_corners=False)
         ph, pw = (-h0) % 8, (-w0) % 8
         lr_p = F.pad(lr, [0, pw, 0, ph], mode="replicate") if (ph or pw) else lr

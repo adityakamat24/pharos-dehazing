@@ -41,7 +41,10 @@ class BilateralGridHead(nn.Module):
 
     def forward(self, feat: torch.Tensor) -> torch.Tensor:
         x = self.body(feat)
-        x = F.adaptive_avg_pool2d(x, (self.size, self.size))
+        # bilinear resize, not adaptive_avg_pool2d: ONNX cannot express adaptive
+        # pooling for non-divisible input sizes and the numerics are equivalent
+        # for a smooth feature map feeding a learned 1x1.
+        x = F.interpolate(x, size=(self.size, self.size), mode="bilinear", align_corners=False)
         x = self.to_grid(x)
         b = x.shape[0]
         return x.view(b, self.coeffs, self.depth, self.size, self.size)
@@ -68,21 +71,27 @@ def slice_grid(grid: torch.Tensor, guidance: torch.Tensor) -> tuple[torch.Tensor
     """Trilinearly slice a bilateral grid at every full-res pixel.
 
     grid: B,12,D,Gh,Gw ; guidance: B,1,H,W in [0,1].
-    Builds 3D sample coords (x=width, y=height, z=guidance) in [-1,1] and uses
-    F.grid_sample (5D). Returns per-pixel affine M (B,9,H,W) and b (B,3,H,W).
+    Because the spatial sample points form a regular mesh, trilinear slicing
+    decomposes exactly into (a) bilinear spatial upsampling of every depth
+    slice (align_corners=True == grid_sample on a linspace(-1,1) mesh) and
+    (b) a per-pixel lerp between the two neighbouring depth slices selected by
+    the guidance value. Identical numerics to 5D grid_sample with border
+    padding, but expressible in ONNX (5D GridSample is not exportable).
+    Returns per-pixel affine M (B,9,H,W) and b (B,3,H,W).
     """
-    b, _, _, _, _ = grid.shape
+    b, c, d, gh, gw = grid.shape
     _, _, h, w = guidance.shape
-    device, dtype = grid.device, grid.dtype
-    ys = torch.linspace(-1.0, 1.0, h, device=device, dtype=dtype)
-    xs = torch.linspace(-1.0, 1.0, w, device=device, dtype=dtype)
-    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-    xx = xx.view(1, 1, h, w).expand(b, 1, h, w)
-    yy = yy.view(1, 1, h, w).expand(b, 1, h, w)
-    zz = guidance * 2.0 - 1.0  # [0,1] -> [-1,1] range axis
-    coords = torch.stack([xx, yy, zz], dim=-1)  # B,1,H,W,3 (x,y,z)
-    sampled = F.grid_sample(grid, coords, mode="bilinear", align_corners=True, padding_mode="border")
-    sampled = sampled.squeeze(2)  # B,12,H,W
+    up = F.interpolate(grid.reshape(b, c * d, gh, gw), size=(h, w), mode="bilinear", align_corners=True)
+    up = up.view(b, c, d, h, w)
+    z = guidance.clamp(0.0, 1.0).squeeze(1) * (d - 1)  # B,H,W in [0, D-1]
+    z0 = z.floor().long().clamp(0, d - 1)
+    z1 = (z0 + 1).clamp(max=d - 1)
+    wz = (z - z0.to(z.dtype)).view(b, 1, h, w)
+    idx0 = z0.view(b, 1, 1, h, w).expand(b, c, 1, h, w)
+    idx1 = z1.view(b, 1, 1, h, w).expand(b, c, 1, h, w)
+    v0 = up.gather(2, idx0).squeeze(2)  # B,c,H,W
+    v1 = up.gather(2, idx1).squeeze(2)
+    sampled = v0 * (1.0 - wz) + v1 * wz
     return sampled[:, :9], sampled[:, 9:12]
 
 
