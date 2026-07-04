@@ -68,6 +68,15 @@ def build_model(cfg: Any) -> Any:
     try:
         PharosNet = _lazy("pharos.models", "PharosNet", why="PharosNet is the v1 backbone.")
         base = _try_calls(PharosNet, [(model_cfg,), (cfg,), ()])
+        inner_ckpt = reveal_cfg.get("inner_ckpt") if isinstance(reveal_cfg, dict) else None
+        if inner_ckpt:
+            import torch
+
+            ck = torch.load(inner_ckpt, map_location="cpu", weights_only=False)
+            state = ck.get("ema", {}).get("shadow") if isinstance(ck.get("ema"), dict) else None
+            state = state or ck.get("model") or ck
+            base.load_state_dict(state, strict=True)
+            print(f"[train_reveal] inner PharosNet initialized from {inner_ckpt}")
         return _try_calls(RevealNet, [(base, reveal_cfg), (base, cfg), (base,)])
     except (RuntimeError, TypeError):
         pass
