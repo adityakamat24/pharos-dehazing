@@ -16,6 +16,8 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+import warnings
+
 import torch
 from torch.utils.data import ConcatDataset, Dataset, Subset
 
@@ -643,6 +645,35 @@ def _cfg_get(cfg: Any, dotted: str, default: Any) -> Any:
     return node
 
 
+class _RobustView(Dataset):
+    """Substitute a neighboring sample when a file is unreadable.
+
+    Real archives ship the occasional truncated/corrupt member (e.g. one bad
+    SateHaze1k zip entry); a multi-hour training run must degrade gracefully
+    instead of dying in a DataLoader worker. Eight consecutive failures still
+    raise — that indicates a broken dataset, not a bad file.
+    """
+
+    def __init__(self, ds: Dataset, name: str = "") -> None:
+        self.ds = ds
+        self.name = name
+
+    def __len__(self) -> int:
+        return len(self.ds)  # type: ignore[arg-type]
+
+    def __getitem__(self, idx: int) -> dict:
+        n = len(self)
+        last: Exception | None = None
+        for hop in range(8):
+            j = (idx + hop * 131) % n
+            try:
+                return self.ds[j]
+            except (FileNotFoundError, OSError) as e:
+                last = e
+                warnings.warn(f"dataset {self.name}: unreadable sample {j} ({e}); substituting")
+        raise RuntimeError(f"dataset {self.name}: 8 consecutive unreadable samples from {idx}") from last
+
+
 def build_dataset(name: str, cfg: Any, split: str = "train") -> Dataset:
     """Factory covering every dataset name used in configs/base.yaml.
 
@@ -659,7 +690,7 @@ def build_dataset(name: str, cfg: Any, split: str = "train") -> Dataset:
         g = torch.Generator().manual_seed(int(_cfg_get(cfg, "seed", 0) or 0))
         idx = torch.randperm(len(ds), generator=g)[: int(cap)].tolist()
         ds = Subset(ds, idx)
-    return ds
+    return _RobustView(ds, name=name)
 
 
 def _build_dataset_impl(name: str, cfg: Any, split: str = "train") -> Dataset:
