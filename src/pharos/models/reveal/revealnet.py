@@ -100,6 +100,7 @@ class RevealNet(nn.Module):
             # First frame: seed memory from the current restoration at low trust.
             memory = RevealMemory.seed(j_mid, self.seed_trust)
             align_full = torch.zeros_like(conf)
+            homog = None
         else:
             memory: RevealMemory = state["memory"]
             homog, tmap, scalar = self.aligner(cur_lr, state["anchor"], motion_prior)
@@ -115,6 +116,8 @@ class RevealNet(nn.Module):
         aux["memory_trust"] = self._resize(memory.trust, (h, w))
         aux["align_trust"] = align_full
         aux["j_restored"] = j
+        if homog is not None:
+            aux["align_H"] = homog  # estimated 3x3 homography (RevealLoss L_align supervision)
         new_state = {"inner": inner_out.state, "memory": memory, "anchor": cur_lr}
         return PharosOutput(
             output=out,

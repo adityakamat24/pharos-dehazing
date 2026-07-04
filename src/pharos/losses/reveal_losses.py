@@ -114,6 +114,31 @@ class RevealLoss:
         h_gt = h_gt.float()
         if h_est.shape[-2:] != (3, 3) or h_gt.shape[-2:] != (3, 3):
             return _z(device)
+        # RevealNet estimates FRAME-TO-FRAME warps in normalized coords (T-1 per
+        # clip: no estimate for frame 0); synthesis GT cam_H is CUMULATIVE from
+        # frame 0 in PIXEL coords. Convert: relative GT = H_t · H_{t-1}^{-1},
+        # then conjugate into normalized coords with the clip's resolution.
+        if h_est.dim() == 4 and h_gt.dim() == 4 and h_est.shape[1] == h_gt.shape[1] - 1:
+            hazy = batch.get("hazy")
+            if hazy is None or hazy.dim() != 5:
+                return _z(device)
+            hh, ww = int(hazy.shape[-2]), int(hazy.shape[-1])
+            s = torch.tensor(
+                [[2.0 / ww, 0.0, -1.0], [0.0, 2.0 / hh, -1.0], [0.0, 0.0, 1.0]], device=device
+            )
+            s_inv = torch.linalg.inv(s)
+            rel = h_gt[:, 1:] @ torch.linalg.inv(h_gt[:, :-1])          # B,T-1,3,3 (pixel)
+            rel_n = s @ rel @ s_inv                                     # normalized coords
+            off_e = homography_to_4pt(h_est.reshape(-1, 3, 3), self.eps)
+            off_g = homography_to_4pt(rel_n.reshape(-1, 3, 3), self.eps)
+            off_gi = homography_to_4pt(
+                torch.linalg.inv(rel_n).reshape(-1, 3, 3), self.eps
+            )
+            # convention-robust: the aligner's warp direction may be either
+            # prev->cur or cur->prev; supervise against the closer one.
+            l_fwd = (off_e - off_g).abs().mean()
+            l_bwd = (off_e - off_gi).abs().mean()
+            return torch.minimum(l_fwd, l_bwd)
         he = h_est.reshape(-1, 3, 3)
         hg = h_gt.reshape(-1, 3, 3)
         if he.shape[0] != hg.shape[0]:

@@ -165,6 +165,20 @@ def _stack_outputs(outs: list[PharosOutput]) -> PharosOutput:
 
     deg_keys = outs[0].deg.keys()
     deg = {k: torch.stack([o.deg[k] for o in outs], dim=1) for k in deg_keys}
+    # Stack aux tensors along T for keys present in EVERY frame with matching
+    # shapes (reveal losses read per-frame aux: staleness/memory_trust/align_H...).
+    # First-frame-absent keys (e.g. align_H) are stacked over the frames that
+    # have them, which loss code must treat as T-1 length via shape.
+    aux: dict[str, torch.Tensor] = {}
+    common = set(outs[0].aux) if isinstance(outs[0].aux, dict) else set()
+    for o in outs[1:]:
+        common &= set(o.aux) if isinstance(o.aux, dict) else set()
+    tail_common = set.intersection(*(set(o.aux) for o in outs[1:])) if len(outs) > 1 else set()
+    for k in common | tail_common:
+        frames = [o.aux[k] for o in outs if isinstance(o.aux, dict) and k in o.aux]
+        if frames and all(torch.is_tensor(v) for v in frames) \
+                and all(v.shape == frames[0].shape for v in frames):
+            aux[k] = torch.stack(frames, dim=1)
     return PharosOutput(
         output=stk("output"),
         confidence=stk("confidence"),
@@ -172,7 +186,7 @@ def _stack_outputs(outs: list[PharosOutput]) -> PharosOutput:
         state=outs[-1].state,
         deg=deg,
         t_hat=stk("t_hat"),
-        aux={},
+        aux=aux,
     )
 
 
