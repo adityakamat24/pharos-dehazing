@@ -1,0 +1,65 @@
+# RevealNet v2 training: confidence-weighted reveal accumulation through moving
+# smoke (DESIGN.md §9c/§9d). Extends PharosNet with a tiered aligner + registered
+# reveal memory {rgb, trust, age} + compositor, supervised by RevealLoss on top of
+# the full v1 loss stack. Launch with scripts/train_reveal.py (injects RevealNet,
+# RevealLoss and the reveal video dataset into the WS-D Trainer via Deps).
+#
+# Curriculum note: this config trains the short-horizon stage (clip_len 8). After
+# it converges, retrain/resume with clip_len 16 then 32 (truncated BPTT on memory)
+# to extend the reveal horizon — bump train.clip_len and lower train.lr.
+_base_: base.yaml
+exp_name: reveal
+
+# --- RevealNet architecture (all defaults per §9d; consumed by the parallel
+#     pharos.models.reveal.RevealNet workstream, ignored by v1 PharosNet) -------
+model:
+  reveal:
+    grid: {size: 384}          # mid-res registered memory buffer, long side (px)
+    half_life: 4.0             # s; half-life of memory trust decay when unconfirmed
+    max_age: 120.0             # s; memory horizon (minutes-scale, O(1) per frame)
+    fps: 30.0                  # assumed frame rate -> staleness/age in seconds
+    thresholds:
+      merge_conf: 0.60         # min restoration confidence c_t to merge J_t into M
+      merge_trust: 0.50        # min alignment trust to merge (else age grows)
+      reset_trust: 0.20        # alignment trust below this -> keyframe re-anchor + reset
+    aligner: {mode: global}    # graceful degradation dense->global->identity (§9d.1)
+
+# --- clip-heavy schedule (reveal supervision needs temporal history) ----------
+train:
+  crop: 256
+  batch: 6                     # small image batch (stability mix; see datasets.train)
+  clip_len: 8                  # frames per temporal sample (short-horizon stage)
+  clip_batch: 4                # clips per video batch
+  clip_period: 1               # every optimiser step pulls a clip (mostly clips)
+  iters: 60000
+  warmup_iters: 1000
+  lr: 2.0e-4
+  weight_decay: 0.01
+  amp: true
+  ema: 0.999
+  ckpt_every: 2000
+  eval_every: 5000
+  num_workers: 4
+  grad_accum: 1
+  channels_last: true
+  log_every: 100
+  img_every: 1000
+
+# --- data: reveal video (synthetic-first) + a small image mix for stability.
+#     The Trainer always builds the image loader, so datasets.train must be
+#     non-empty even though clip_period=1 makes clips the dominant modality. -----
+datasets:
+  train: [reside6k, synth_smoke, clear_passthrough]
+  train_video: [reveal_video, synth_video]
+  eval: [smokebench_test, sots_mix]
+  eval_noref: [rtts]
+  eval_video: [reveal_video]
+
+# --- loss: full v1 stack (inherited from base.yaml) + reveal terms ------------
+loss:
+  reveal:
+    recall: 1.0                # L_recall: match GT on occluded-but-previously-seen pixels
+    align: 0.2                 # L_align: 4-pt offset L1, estimated vs GT homography (cam_H)
+    stale: 0.05               # L_stale: Laplace-NLL calibration of memory trust
+    occ_thresh: 0.6            # smoke_density >= this counts a pixel as occluded now
+    reveal_thresh: 0.3         # smoke_density <= this counts a pixel as revealed
