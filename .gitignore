@@ -5,13 +5,14 @@ __pycache__/
 *.egg-info/
 
 # Data & experiment outputs (never commit datasets or weights)
-data/
-datasets/
-checkpoints/
-weights/
-runs/
-outputs/
-wandb/
+# (anchored to repo root so src/pharos/data/ etc. stay tracked)
+/data/
+/datasets/
+/checkpoints/
+/weights/
+/runs/
+/outputs/
+/wandb/
 *.pth
 *.pt
 *.ckpt
