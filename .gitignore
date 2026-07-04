@@ -28,3 +28,6 @@ Thumbs.db
 *.tmp
 *.log
 *.stackdump
+
+# Claude session worktrees
+.claude/worktrees/
