@@ -685,12 +685,25 @@ def build_dataset(name: str, cfg: Any, split: str = "train") -> Dataset:
     capped to that many samples, chosen deterministically from ``cfg.seed``.
     """
     ds = _build_dataset_impl(name, cfg, split)
+    # NTIRE convention split for the small flat real-haze sets (no train/test
+    # dirs on disk): train = all but the last 5 pairs, eval = last 5. Off by
+    # default so long-run eval curves stay comparable; REQUIRED (set
+    # datasets.ntire_split: true) for any config that trains on these sets,
+    # otherwise fine-tuning would train on the benchmark images.
+    if bool(_cfg_get(cfg, "datasets.ntire_split", False)) and name in _NTIRE_FLAT:
+        n = len(ds)
+        if n > 5:
+            idx = list(range(0, n - 5)) if split == "train" else list(range(n - 5, n))
+            ds = Subset(ds, idx)
     cap = _cfg_get(cfg, "data_subset", None)
     if cap and len(ds) > int(cap):
         g = torch.Generator().manual_seed(int(_cfg_get(cfg, "seed", 0) or 0))
         idx = torch.randperm(len(ds), generator=g)[: int(cap)].tolist()
         ds = Subset(ds, idx)
     return _RobustView(ds, name=name)
+
+
+_NTIRE_FLAT = {"nhhaze", "densehaze", "ohaze", "ihaze"}
 
 
 def _build_dataset_impl(name: str, cfg: Any, split: str = "train") -> Dataset:

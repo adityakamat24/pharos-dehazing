@@ -3,10 +3,10 @@
 # train splits) mixed with a slice of the original diet to avoid forgetting.
 # Expected effect: several dB on NH-HAZE/Dense-Haze at little cost elsewhere.
 #
-# BLOCKER before running: the downloaded NTIRE sets are flat folders (no
-# train/test dirs) and the eval protocol currently scores ALL pairs. Implement
-# an index split in build_dataset (train = first N-5 pairs, eval = last 5,
-# NTIRE convention) or fine-tuning would train on the benchmark images.
+# datasets.ntire_split below activates the index split for the flat NTIRE sets
+# (train = all but last 5 pairs, eval = last 5) so fine-tuning never trains on
+# the benchmark images. Note stage-2 eval numbers for nhhaze/densehaze are on
+# the 5-pair held-out split (n=5), not directly comparable to stage-1 curves.
 _base_: pod_full.yaml
 exp_name: finetune_real
 
@@ -20,6 +20,7 @@ train:
   resume: /workspace/runs/full/ckpt/last.pt   # continues from the main run
 
 datasets:
+  ntire_split: true
   train:
     - nhhaze            # 50 real pairs (train split)
     - densehaze         # 50 real pairs
