@@ -292,6 +292,19 @@ class Trainer:
         it = self._vid_iter if modality == "video" else self._img_iter
         assert it is not None
         batch = it.next()
+        # Reject non-finite inputs BEFORE the forward pass: a NaN input poisons
+        # BatchNorm running statistics during the forward itself, which the
+        # post-hoc loss guard cannot undo (train mode uses batch stats, so the
+        # damage only surfaces at eval — silently).
+        for _ in range(4):
+            hz, cl = batch.get("hazy"), batch.get("clean")
+            ok = torch.isfinite(hz).all() and (cl is None or torch.isfinite(cl).all())
+            if ok:
+                break
+            metas = batch.get("meta")
+            src = {m.get("dataset") for m in metas if isinstance(m, dict)} if isinstance(metas, list) else "?"
+            warnings.warn(f"non-finite INPUT batch (datasets={src}); refetching.")
+            batch = it.next()
         batch = move_batch_to_device(
             batch, self.device, channels_last=self.channels_last and modality == "image"
         )
@@ -321,10 +334,11 @@ class Trainer:
                 # the weights: name the bad terms, drop the step, keep training.
                 bad = [k for k, v in scalars.items() if not math.isfinite(float(v))]
                 self._nan_skips = getattr(self, "_nan_skips", 0) + 1
+                healed = _sanitize_bn_stats(self.model, self.ema)
                 warnings.warn(
                     f"non-finite loss at step {self.step} (modality={modality}, "
                     f"bad terms={bad or ['total']}); skipping batch "
-                    f"({self._nan_skips} skipped so far)."
+                    f"({self._nan_skips} skipped so far; {healed} BN buffers healed)."
                 )
                 if self._nan_skips > 200:
                     raise RuntimeError("more than 200 non-finite batches; aborting run")
@@ -470,6 +484,35 @@ class Trainer:
 
 def _auto_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _sanitize_bn_stats(model: torch.nn.Module, ema=None) -> int:
+    """Reset non-finite BatchNorm running statistics (model + EMA shadow).
+
+    A single NaN forward pollutes BN running stats permanently (train mode uses
+    batch stats, so training looks healthy while eval breaks); the EMA lerp then
+    keeps NaN forever. Called whenever a non-finite loss is detected.
+    """
+    healed = 0
+    with torch.no_grad():
+        for m in model.modules():
+            if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
+                if m.running_mean is not None and not torch.isfinite(m.running_mean).all():
+                    m.running_mean.zero_()
+                    healed += 1
+                if m.running_var is not None and not torch.isfinite(m.running_var).all():
+                    m.running_var.fill_(1.0)
+                    healed += 1
+        shadow = getattr(ema, "shadow", None)
+        if isinstance(shadow, dict):
+            for k, v in shadow.items():
+                if "running_mean" in k and torch.is_tensor(v) and not torch.isfinite(v).all():
+                    v.zero_()
+                    healed += 1
+                elif "running_var" in k and torch.is_tensor(v) and not torch.isfinite(v).all():
+                    v.fill_(1.0)
+                    healed += 1
+    return healed
 
 
 def _maybe_build_teachers(deps: Deps, cfg: Config):
