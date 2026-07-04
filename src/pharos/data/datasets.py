@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 import torch
-from torch.utils.data import ConcatDataset, Dataset
+from torch.utils.data import ConcatDataset, Dataset, Subset
 
 from ..contracts import DOMAIN_HAZE, DOMAIN_NAMES, DOMAIN_SATELLITE, DOMAIN_SMOKE
 from . import synthesis, transforms
@@ -649,7 +649,20 @@ def build_dataset(name: str, cfg: Any, split: str = "train") -> Dataset:
     ``split`` is 'train' or 'eval'/'test'. In train split, random crop (cfg.train.crop)
     and flips are enabled; in eval split, full-resolution images are returned (use a
     DataLoader with batch_size=1 and :func:`pharos_collate`).
+
+    When ``cfg.data_subset`` is set (e.g. configs/overfit50.yaml), the dataset is
+    capped to that many samples, chosen deterministically from ``cfg.seed``.
     """
+    ds = _build_dataset_impl(name, cfg, split)
+    cap = _cfg_get(cfg, "data_subset", None)
+    if cap and len(ds) > int(cap):
+        g = torch.Generator().manual_seed(int(_cfg_get(cfg, "seed", 0) or 0))
+        idx = torch.randperm(len(ds), generator=g)[: int(cap)].tolist()
+        ds = Subset(ds, idx)
+    return ds
+
+
+def _build_dataset_impl(name: str, cfg: Any, split: str = "train") -> Dataset:
     data_root = Path(_cfg_get(cfg, "data_root", "data"))
     lowres = int(_cfg_get(cfg, "model.lowres", 256))
     crop = int(_cfg_get(cfg, "train.crop", 256))
