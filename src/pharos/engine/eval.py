@@ -132,8 +132,27 @@ def _model_out(model, hazy: torch.Tensor) -> torch.Tensor:
     return model(hazy, state=None).output
 
 
+def _cap_size(t: Optional[torch.Tensor], max_side: int) -> Optional[torch.Tensor]:
+    """Downscale so the long side <= max_side (bilinear, antialiased).
+
+    Full-res slicing materializes coeffs*depth channels at output resolution;
+    multi-megapixel eval images (NH-HAZE is >4K) spike several GB and OOM'd a
+    live run. Metrics are computed at the capped size (consistent within-run
+    tracking; the final benchmark protocol can tile at native res).
+    """
+    if t is None or max_side <= 0:
+        return t
+    h, w = t.shape[-2], t.shape[-1]
+    if max(h, w) <= max_side:
+        return t
+    s = max_side / max(h, w)
+    return F.interpolate(t, size=(int(h * s), int(w * s)), mode="bilinear",
+                         align_corners=False, antialias=True)
+
+
 @torch.no_grad()
-def _run_paired(model, loader, device, lpips_model, max_batches: Optional[int]) -> dict[str, float]:
+def _run_paired(model, loader, device, lpips_model, max_batches: Optional[int],
+                max_side: int = 2048) -> dict[str, float]:
     psnr = ssim = lp = 0.0
     n = 0
     lp_ok = 0
@@ -143,8 +162,9 @@ def _run_paired(model, loader, device, lpips_model, max_batches: Optional[int]) 
         batch = move_batch_to_device(batch, device)
         if batch.get("clean") is None:
             continue
-        out = _model_out(model, batch["hazy"])
-        clean = batch["clean"]
+        hazy = _cap_size(batch["hazy"], max_side)
+        out = _model_out(model, hazy)
+        clean = _cap_size(batch["clean"], max_side)
         b = out.shape[0]
         psnr += M.psnr(out, clean) * b
         ssim += M.ssim(out, clean) * b
@@ -323,9 +343,11 @@ def evaluate(
         lpips_model = M.LPIPS(device=device)
 
     results: dict[str, Any] = {"step": int(step), "notes": []}
+    ev = cfg.get("eval", {}) if isinstance(cfg.get("eval"), dict) else {}
+    max_side = int(ev.get("max_side", 2048))
 
     results["paired"] = {
-        name: _run_paired(model, ld, device, lpips_model, max_batches)
+        name: _run_paired(model, ld, device, lpips_model, max_batches, max_side=max_side)
         for name, ld in (paired_loaders or {}).items()
     }
     results["noref"] = {

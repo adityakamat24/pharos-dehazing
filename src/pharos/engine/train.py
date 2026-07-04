@@ -428,6 +428,10 @@ class Trainer:
         finally:
             self.ema.restore(self.model)
             self.model.train()
+            if self.device.type == "cuda":
+                # Full-res eval leaves the allocator full/fragmented; without this
+                # the next training step can OOM outside any guard.
+                torch.cuda.empty_cache()
 
     def _default_eval(self) -> Optional[dict]:
         from .eval import evaluate
