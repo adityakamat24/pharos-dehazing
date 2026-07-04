@@ -241,7 +241,9 @@ class Trainer:
         self.ckpt_every = int(tcfg.get("ckpt_every", 2000))
         self.eval_every = int(tcfg.get("eval_every", 5000))
 
-        if tcfg.get("resume"):
+        if tcfg.get("resume_weights_only"):
+            self._resume_weights_only(tcfg.get("resume_weights_only"))
+        elif tcfg.get("resume"):
             self._maybe_resume(tcfg.get("resume"))
 
     # ------------------------------------------------------------------ build
@@ -496,6 +498,20 @@ class Trainer:
             print(f"resumed from {path} at step {self.step}")
         else:
             warnings.warn(f"resume requested but no checkpoint at {path}")
+
+    def _resume_weights_only(self, resume: Any) -> None:
+        """Stage-2 init: load model+EMA weights from a checkpoint but keep a fresh
+        step/optimizer/scheduler (full resume would restore step past the new
+        horizon and the run would exit immediately)."""
+        path = Path(resume)
+        if not path.exists():
+            warnings.warn(f"resume_weights_only requested but no checkpoint at {path}")
+            return
+        ck = load_checkpoint(path, map_location=self.device)
+        self.model.load_state_dict(ck["model"], strict=True)
+        if ck.get("ema") and getattr(self.ema, "load_state_dict", None):
+            self.ema.load_state_dict(ck["ema"])
+        print(f"initialized weights (+EMA) from {path}; fresh schedule at step 0")
 
 
 # ---------------------------------------------------------------------------

@@ -17,7 +17,9 @@ train:
   ema: 0.999
   ckpt_every: 2500
   eval_every: 5000
-  resume: /workspace/runs/full/ckpt/last.pt   # continues from the main run
+  # weights-only: fresh 15k schedule (full resume would restore step=100k > 15k
+  # and exit immediately)
+  resume_weights_only: /workspace/runs/full/ckpt/last.pt
 
 datasets:
   ntire_split: true
