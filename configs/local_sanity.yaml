@@ -1,0 +1,35 @@
+# Small mixed run sized for an RTX 3060 (6 GB): image + clip batches, AMP,
+# channels_last, gradient accumulation. Not meant to reach SOTA — it exercises
+# the full pipeline end-to-end on local hardware before renting a pod. (DESIGN M4.)
+_base_: base.yaml
+exp_name: local_sanity
+
+train:
+  crop: 256
+  batch: 8
+  clip_len: 3
+  clip_batch: 2         # clips per video batch (kept small for VRAM)
+  clip_period: 4        # every 4th optimiser step pulls a video (clip) batch
+  iters: 20000
+  warmup_iters: 500
+  lr: 3.0e-4
+  amp: true
+  ema: 0.999
+  ckpt_every: 2000
+  eval_every: 2000
+  num_workers: 4        # requires the __main__ guard (present in train.py)
+  grad_accum: 2         # effective image batch 16 within 6 GB
+  channels_last: true
+  log_every: 50
+  img_every: 500
+
+datasets:
+  train: [reside6k, smokebench, satehaze1k, synth_haze, synth_smoke, clear_passthrough]
+  train_video: [revide]
+  eval: [sots_mix, smokebench_test, satehaze1k_test]
+  eval_noref: [rtts]
+  eval_video: [revide]
+
+eval:
+  batch: 1
+  max_batches: 50       # cap periodic in-training eval for speed

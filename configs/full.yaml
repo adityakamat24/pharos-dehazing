@@ -1,0 +1,50 @@
+# Pod-scale training (vast.ai, user-gated / billed — DESIGN M6). Batch 32, 200k
+# iters, full local working set plus the pod-only large corpora. Assumes a
+# 24 GB+ GPU; drop batch / raise grad_accum for smaller cards.
+_base_: base.yaml
+exp_name: full
+
+train:
+  crop: 256
+  batch: 32
+  clip_len: 3
+  clip_batch: 6
+  clip_period: 3
+  iters: 200000
+  warmup_iters: 2000
+  lr: 3.0e-4
+  weight_decay: 0.01
+  amp: true
+  ema: 0.999
+  ckpt_every: 2000
+  eval_every: 5000
+  num_workers: 8
+  grad_accum: 1
+  channels_last: true
+  log_every: 100
+  img_every: 1000
+
+datasets:
+  train:
+    - reside6k
+    - smokebench
+    - satehaze1k
+    - synth_haze
+    - synth_smoke
+    - synth_satellite
+    - clear_passthrough
+    # Pod-only large corpora (TODO: enable once downloaded to the pod):
+    # - reside_ots_full
+    # - hazeworld            # 326k frames
+    # - rs_haze
+  train_video:
+    - revide
+    - synth_video
+    # - hazeworld_video      # TODO pod-only
+  eval: [sots_mix, nhhaze, densehaze, smokebench_test, satehaze1k_test, rice1]
+  eval_noref: [rtts]
+  eval_video: [revide]
+
+eval:
+  batch: 1
+  max_batches: null       # full eval sets at pod scale
