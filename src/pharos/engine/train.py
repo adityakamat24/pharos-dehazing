@@ -26,6 +26,7 @@ below (multiprocessing 'spawn'); ``persistent_workers`` is enabled only when
 from __future__ import annotations
 
 import argparse
+import gc
 import importlib
 import math
 import warnings
@@ -328,7 +329,21 @@ class Trainer:
         did_backward = False
         for _ in range(self.grad_accum):
             modality = self._pick_modality(self.step)
-            loss, scalars, n, out, batch = self._forward_loss(modality)
+            try:
+                loss, scalars, n, out, batch = self._forward_loss(modality)
+            except torch.OutOfMemoryError:
+                # Last line of defense: a transient allocator spike (e.g. right
+                # after a full eval) must not kill a multi-hour run.
+                self._oom_skips = getattr(self, "_oom_skips", 0) + 1
+                self.optimizer.zero_grad(set_to_none=True)
+                self._last_out = None  # drop the previous step's held graph
+                gc.collect()
+                torch.cuda.empty_cache()
+                warnings.warn(f"OOM at step {self.step}; cache purged, batch skipped "
+                              f"({self._oom_skips} so far).")
+                if self._oom_skips > 20:
+                    raise
+                continue
             if not bool(torch.isfinite(loss.detach())):
                 # A poisoned batch (bad image, teacher blow-up) must not corrupt
                 # the weights: name the bad terms, drop the step, keep training.
@@ -428,9 +443,11 @@ class Trainer:
         finally:
             self.ema.restore(self.model)
             self.model.train()
+            # Full-res eval leaves the allocator full/fragmented; without this
+            # the next training step can OOM outside any guard. gc first so
+            # lingering exception frames release their tensor locals.
+            gc.collect()
             if self.device.type == "cuda":
-                # Full-res eval leaves the allocator full/fragmented; without this
-                # the next training step can OOM outside any guard.
                 torch.cuda.empty_cache()
 
     def _default_eval(self) -> Optional[dict]:

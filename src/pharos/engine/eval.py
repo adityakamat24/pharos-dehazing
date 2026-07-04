@@ -21,6 +21,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import warnings
 from pathlib import Path
@@ -204,6 +205,13 @@ def _run_noref(model, loader, device, max_batches: Optional[int]) -> dict[str, A
     }
 
 
+def _cap_clip(clip: torch.Tensor, max_side: int) -> torch.Tensor:
+    """Apply :func:`_cap_size` framewise to a B,T,3,H,W clip."""
+    b, t = clip.shape[0], clip.shape[1]
+    capped = _cap_size(clip.flatten(0, 1), max_side)
+    return capped.reshape(b, t, *capped.shape[1:])
+
+
 @torch.no_grad()
 def _clip_outputs(model, frames: torch.Tensor) -> torch.Tensor:
     """Run the recurrent model over a clip (B,T,3,H,W) -> outputs (B,T,3,H,W)."""
@@ -217,20 +225,30 @@ def _clip_outputs(model, frames: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def _run_temporal(model, loader, device, teachers, max_batches: Optional[int]) -> dict[str, Any]:
+def _run_temporal(model, loader, device, teachers, max_batches: Optional[int],
+                  max_side: int = 1024, max_windows: int = 60) -> dict[str, Any]:
+    """Temporal consistency on clips.
+
+    Hard memory bounds: frames are capped to ``max_side`` (RAFT's correlation
+    volume grows quadratically with pixels — full-res REVIDE OOMs a 24GB card)
+    and at most ``max_windows`` clip windows are scored (statistically ample).
+    """
     err = 0.0
     pairs = 0
     used_flow = False
     have_flow = teachers is not None and getattr(teachers, "flow", None) is not None
+    limit = min(max_batches or max_windows, max_windows)
     for i, batch in enumerate(loader):
-        if max_batches and i >= max_batches:
+        if i >= limit:
             break
         batch = move_batch_to_device(batch, device)
         frames = batch["hazy"]
         if frames.dim() != 5:
             continue
-        outs = _clip_outputs(model, frames)
+        frames = _cap_clip(frames, max_side)
         clean = batch.get("clean")
+        clean = _cap_clip(clean, max_side) if clean is not None and clean.dim() == 5 else clean
+        outs = _clip_outputs(model, frames)
         for t in range(1, frames.shape[1]):
             flow = None
             if have_flow and clean is not None:
@@ -346,18 +364,30 @@ def evaluate(
     ev = cfg.get("eval", {}) if isinstance(cfg.get("eval"), dict) else {}
     max_side = int(ev.get("max_side", 2048))
 
+    def _purge() -> None:
+        # Bound the allocator between sections; a full eval must never leave the
+        # GPU too full for the next training step (has OOM'd a live run twice).
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
     results["paired"] = {
         name: _run_paired(model, ld, device, lpips_model, max_batches, max_side=max_side)
         for name, ld in (paired_loaders or {}).items()
     }
+    _purge()
     results["noref"] = {
         name: _run_noref(model, ld, device, max_batches)
         for name, ld in (noref_loaders or {}).items()
     }
+    _purge()
     results["temporal"] = {
-        name: _run_temporal(model, ld, device, teachers, max_batches)
+        name: _run_temporal(model, ld, device, teachers, max_batches,
+                            max_side=int(ev.get("temporal_max_side", 1024)),
+                            max_windows=int(ev.get("temporal_max_windows", 60)))
         for name, ld in (clip_loaders or {}).items()
     }
+    _purge()
 
     # clear-frame no-harm: use explicit loader, else first paired loader with clean.
     ch_loader = clear_loader
