@@ -77,6 +77,21 @@ def build_model(cfg: Any) -> Any:
             state = state or ck.get("model") or ck
             base.load_state_dict(state, strict=True)
             print(f"[train_reveal] inner PharosNet initialized from {inner_ckpt}")
+        if isinstance(reveal_cfg, dict) and reveal_cfg.get("freeze_inner"):
+            # Train only the reveal machinery (~33k params): preserves the audited
+            # v1 restoration quality exactly and converges far faster. Without
+            # this, clip-heavy reveal training drifts the backbone (observed:
+            # SmokeBench 20.7->18.7 by step 5k).
+            n_frozen = 0
+            for p in base.parameters():
+                p.requires_grad = False
+                n_frozen += 1
+            # Pin eval mode: Trainer calls model.train() every step, which would
+            # still update the frozen backbone's BatchNorm running stats (silent
+            # drift). Instance-level no-op shadows nn.Module.train for `base`.
+            base.eval()
+            base.train = lambda mode=True: base  # type: ignore[method-assign]
+            print(f"[train_reveal] inner backbone FROZEN ({n_frozen} param tensors, eval-pinned)")
         return _try_calls(RevealNet, [(base, reveal_cfg), (base, cfg), (base,)])
     except (RuntimeError, TypeError):
         pass
