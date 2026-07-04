@@ -161,7 +161,16 @@ def load_model(
                 break
         if state is None:
             state = ckpt
+        # The engine's EMA saves an envelope {"decay": float, "shadow": {param: tensor}}.
+        if "shadow" in state and isinstance(state["shadow"], dict):
+            state = state["shadow"]
         missing, unexpected = model.load_state_dict(state, strict=False)  # type: ignore[union-attr]
+        n_params = sum(1 for _ in model.state_dict())  # type: ignore[union-attr]
+        if missing and len(missing) >= n_params:
+            raise ValueError(
+                f"load_model: no checkpoint keys matched the model ({len(unexpected)} unexpected); "
+                f"refusing to run with untrained weights. Checkpoint keys: {sorted(ckpt)[:8]}"
+            )
         if missing or unexpected:
             warnings.warn(
                 f"load_model: {len(missing)} missing / {len(unexpected)} unexpected keys", stacklevel=2

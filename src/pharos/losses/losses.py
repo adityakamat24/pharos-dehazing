@@ -84,13 +84,23 @@ class PharosLoss:
         fc = torch.fft.rfft2(clean.float(), dim=(-2, -1))
         return (fo.abs() - fc.abs()).abs().mean()
 
-    # L_conf — heteroscedastic Laplace NLL.
-    # confidence in (0,1] is read as precision p; sigma = 1/p, so
-    #   NLL = |err|/sigma + log sigma = |err|·p − log p   (numerically stable).
+    # L_conf — heteroscedastic Laplace NLL on the predicted log-variance:
+    #   sigma = exp(logvar),  NLL = |err|/sigma + log sigma = |err|·exp(−lv) + lv.
+    # The optimum is sigma* = |err| — informative for image errors in [0,1].
+    # (Reading confidence in (0,1] as a precision would pin the optimum to the
+    # p=1 boundary for every pixel, so the raw logvar from aux is required; the
+    # precision form is kept only as a fallback for models that don't expose it.)
     def _conf(self, out: PharosOutput, clean: Optional[torch.Tensor], device) -> torch.Tensor:
         if clean is None or out.confidence is None:
             return _z(device)
         err = (out.output - clean).abs().mean(dim=1, keepdim=True)  # B,1,H,W
+        aux = out.aux if isinstance(out.aux, dict) else {}
+        logvar = aux.get("logvar")
+        if logvar is not None:
+            lv = logvar.clamp(-6.0, 3.0)
+            if lv.shape[-2:] != err.shape[-2:]:
+                lv = F.interpolate(lv, size=err.shape[-2:], mode="bilinear", align_corners=False)
+            return (err * torch.exp(-lv) + lv).mean()
         conf = out.confidence
         if conf.shape[-2:] != err.shape[-2:]:
             conf = F.interpolate(conf, size=err.shape[-2:], mode="bilinear", align_corners=False)

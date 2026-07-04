@@ -53,13 +53,18 @@ class DegradationHead(nn.Module):
 
 
 class ConfidenceHead(nn.Module):
-    """Low-res log-variance -> full-res calibrated confidence in (0,1].
+    """Low-res log-variance -> full-res confidence in (0,1].
 
-    Map: conf = exp(-relu(logvar)). It is monotone non-increasing in the predicted
-    log-variance: logvar <= 0 -> conf = 1 (fully trusted), large logvar -> conf -> 0.
-    Returns (confidence, logvar) both at full res; logvar feeds the heteroscedastic
-    NLL loss (|J-GT|/sigma + log sigma) downstream.
+    sigma = exp(logvar) is the predicted Laplace error scale (NLL-trained, so
+    sigma* ~= expected |err|, which lives in [0,1] for image data). Display map:
+    conf = exp(-sigma / S0) with S0 = 0.1 — sigma 0 gives conf 1, sigma ~0.1
+    (10% mean abs error) gives ~0.37, sigma >= 0.3 goes to ~0. A relu-clamped
+    map (conf = exp(-relu(logvar))) would saturate at 1 for every logvar <= 0,
+    i.e. for all realistic image error scales.
+    Returns (confidence, logvar) at full res; the raw logvar feeds the NLL loss.
     """
+
+    ERROR_SCALE = 0.1
 
     def __init__(self, in_ch: int, mid: int = 16) -> None:
         super().__init__()
@@ -70,7 +75,8 @@ class ConfidenceHead(nn.Module):
     def forward(self, feat: torch.Tensor, out_hw: tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor]:
         logvar_lr = self.net(feat)
         logvar = F.interpolate(logvar_lr, size=out_hw, mode="bilinear", align_corners=False)
-        conf = torch.exp(-F.relu(logvar))
+        sigma = torch.exp(logvar.clamp(-6.0, 3.0))
+        conf = torch.exp(-sigma / self.ERROR_SCALE).clamp_min(1e-6)
         return conf, logvar
 
 
