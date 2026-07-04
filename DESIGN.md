@@ -198,6 +198,28 @@ commit to your branch `ws/<name>`.
   model-only. FP16 ≈ FP32 ⇒ launch/bandwidth-bound; ONNX-Runtime/TensorRT export is the
   planned path to the ≥30 FPS @1080p target (M7).
 
+## 9c. v2 direction — temporal accumulation through moving smoke
+
+Dense smoke/haze (t→0) is a physics wall for single-frame restoration: the scene's photons
+never reached the sensor, and fine-tuning cannot recover information that does not exist.
+Pharos deliberately refuses to hallucinate there (N4). Three escalation paths, ranked by
+fit to the mission:
+
+1. **Temporal accumulation (v2 headline).** Smoke is turbulent: over seconds, different
+   frames reveal different patches of the background. Extend the recurrent state into a
+   long-horizon, confidence-weighted scene memory — accumulate each frame's *reliable*
+   pixels (as judged by the confidence head) into an aligned reveal-buffer, and composite
+   current-frame restoration with remembered content, displaying age/staleness alongside
+   confidence. "A long exposure through swirling smoke": physically honest, zero invention,
+   natural fit to the causal-recurrent design. No published real-time method does this for
+   smoke (checked 2026-07: video dehazing uses 1-3 frame windows for consistency, not
+   long-horizon revelation accumulation).
+2. **Confidence-gated generative infill (photography mode only).** A generative refiner may
+   synthesize content exclusively inside low-confidence regions, rendered with an explicit
+   "synthesized" marking. Never available in the safety path.
+3. **Thermal/LWIR fusion.** The only true answer at t≈0 for static scenes; requires the
+   sensor. Input hook reserved (§3 conditioning).
+
 ## 10. Milestones
 
 M1 skeleton+contracts (lead) → M2 parallel workstreams (Opus, worktrees) → M3 merge + review + fix →
