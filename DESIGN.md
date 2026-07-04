@@ -220,6 +220,47 @@ fit to the mission:
 3. **Thermal/LWIR fusion.** The only true answer at t≈0 for static scenes; requires the
    sensor. Input hook reserved (§3 conditioning).
 
+## 9d. v2 design — RevealNet: confidence-weighted reveal accumulation (approved 2026-07-04)
+
+Novelty position (adversarially verified): the compositing mechanic has a long lineage
+(Granados'12 background inpainting, obstruction-free photography'15/'20, lucky imaging /
+DATUM'24 at 9 FPS non-causal), and the 2025 3DGS cluster (SmokeSeer, DehazeGS) validates the
+premise offline/multi-view — but **no prior work is simultaneously**: dense volumetric smoke,
+causal monocular streaming, multi-second memory horizon, real camera motion, real-time edge
+budget, and a user-facing **staleness** display (no analog in restoration at all; nearest is
+robotics occupancy-grid decay). Datasets for this setting do not exist publicly → synthetic
+reveal supervision + Fire360/A2I2-Haze for real validation is itself a contribution.
+
+Architecture (extends PharosNet; all new modules ≤ +0.6M params, ≥25 FPS @720p target):
+
+1. **Tiered aligner** (low-res features → warp of memory into current view, ~2-4ms):
+   content-aware global homography head with per-region trust mask (deep-homography style);
+   optional gyro/IMU and codec motion-vector inputs as free motion priors (hooks, GyroFlow
+   pattern: sensor prior + visual residual); graceful degradation dense→global→identity as
+   alignment trust drops; keyframe re-anchor + memory reset on tracking loss.
+2. **Reveal memory** (the core; mid-res registered buffer): M = {rgb, trust, age}.
+   Update per frame (burst-photography robust-merge pattern, Super-Res-Zoom's accumulated
+   robustness mask as precedent): where restoration confidence c_t AND alignment trust are
+   high → merge J_t into M (noise-model-aware lerp), reset age; elsewhere age grows and
+   trust decays. Strict causality; memory horizon minutes, cost O(1) per frame.
+3. **Compositor**: output = per-pixel blend of current restoration J_t and remembered M.rgb,
+   arbitrated by c_t vs decayed memory trust; emits the blended frame + confidence + **staleness
+   map** (seconds since a pixel was last directly confirmed) rendered as an overlay in the demo.
+4. **Supervision** (synthetic-first): drifting/billowing dense Perlin smoke composited over
+   clean VIDEO (synth_video pipeline extended: opaque cores t≈0, turbulent motion, camera
+   homography jitter): GT background known at every pixel/frame → losses on composite vs GT,
+   memory-trust calibration (NLL as v1), alignment supervision from the known synthetic warp,
+   and a **reveal metric**: PSNR-over-time + fraction-of-scene-recovered vs seconds observed.
+   Curriculum: T=8 clips → T=32 via truncated BPTT on memory. Real validation: REVIDE,
+   A2I2-Haze, Fire360 (qualitative), SmokeBench-video-style captures if obtainable.
+5. **Photography mode (Idea B, phase 2)**: one-step inpainting model gated by (1 − c_t)
+   ∧ (1 − memory trust), synthesized regions persistently hatched/marked (per-region
+   disclosure beyond C2PA whole-asset granularity). Never available in safety mode.
+
+Baselines to beat/compare: MAP-Net (memory + physical prior, REVIDE), DATUM (turbulence
+recurrence), Turtle (causal history), v1 Pharos (no memory). Ablations: memory on/off,
+staleness display on/off (operator study), gyro on/off, horizon length.
+
 ## 10. Milestones
 
 M1 skeleton+contracts (lead) → M2 parallel workstreams (Opus, worktrees) → M3 merge + review + fix →
