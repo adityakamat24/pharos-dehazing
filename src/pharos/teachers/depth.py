@@ -106,10 +106,14 @@ class DepthTeacher:
         if not self.available or self._model is None:
             return torch.zeros((b, 1, out_hw[0], out_hw[1]), device=img.device, dtype=img.dtype)
 
-        img = img.to(self.device)
-        pixel_values = self._preprocess(img)
-        out = self._model(pixel_values=pixel_values)
-        depth = out.predicted_depth  # B,h',w' (disparity-like: higher = closer)
+        # fp32 island: the ViT is not reliably fp16-safe and we may be inside
+        # the trainer's AMP autocast context.
+        dev_type = self.device.type if hasattr(self.device, "type") else "cuda"
+        with torch.autocast(device_type=dev_type, enabled=False):
+            img = img.to(self.device).float()
+            pixel_values = self._preprocess(img)
+            out = self._model(pixel_values=pixel_values)
+            depth = out.predicted_depth  # B,h',w' (disparity-like: higher = closer)
         if depth.dim() == 3:
             depth = depth.unsqueeze(1)
         depth = F.interpolate(depth.float(), size=out_hw, mode="bilinear", align_corners=False)

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import math
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -311,14 +312,33 @@ class Trainer:
         agg: dict[str, float] = {}
         imgs = 0
         last_out = last_batch = last_modality = None
+        did_backward = False
         for _ in range(self.grad_accum):
             modality = self._pick_modality(self.step)
             loss, scalars, n, out, batch = self._forward_loss(modality)
+            if not bool(torch.isfinite(loss.detach())):
+                # A poisoned batch (bad image, teacher blow-up) must not corrupt
+                # the weights: name the bad terms, drop the step, keep training.
+                bad = [k for k, v in scalars.items() if not math.isfinite(float(v))]
+                self._nan_skips = getattr(self, "_nan_skips", 0) + 1
+                warnings.warn(
+                    f"non-finite loss at step {self.step} (modality={modality}, "
+                    f"bad terms={bad or ['total']}); skipping batch "
+                    f"({self._nan_skips} skipped so far)."
+                )
+                if self._nan_skips > 200:
+                    raise RuntimeError("more than 200 non-finite batches; aborting run")
+                continue
             self.scaler.scale(loss / self.grad_accum).backward()
+            did_backward = True
             for k, v in scalars.items():
                 agg[k] = agg.get(k, 0.0) + float(v) / self.grad_accum
             imgs += n
             last_out, last_batch, last_modality = out, batch, modality
+        if not did_backward:
+            self.optimizer.zero_grad(set_to_none=True)
+            agg["_imgs"] = imgs
+            return agg
         self.scaler.unscale_(self.optimizer)
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.scaler.step(self.optimizer)

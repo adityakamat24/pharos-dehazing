@@ -83,11 +83,15 @@ class FlowTeacher:
             self._load()
         if not self.available or self._model is None:
             return torch.zeros((bsz, 2, h, w), device=a.device, dtype=a.dtype)
-        # RAFT wants [-1,1] inputs and spatial dims divisible by 8.
-        a_n = (a.to(self.device) * 2.0 - 1.0)
-        b_n = (b.to(self.device) * 2.0 - 1.0)
-        a_p, (oh, ow) = self._pad_to_multiple(a_n)
-        b_p, _ = self._pad_to_multiple(b_n)
-        preds = self._model(a_p, b_p)  # list of iterative predictions
-        flow = preds[-1][:, :, :oh, :ow]
+        # RAFT wants [-1,1] inputs and spatial dims divisible by 8. It is NOT
+        # fp16-safe: run in an autocast-free fp32 island (we may be called from
+        # inside the trainer's AMP context).
+        with torch.autocast(device_type=self.device.type if hasattr(self.device, "type") else "cuda",
+                            enabled=False):
+            a_n = a.to(self.device).float() * 2.0 - 1.0
+            b_n = b.to(self.device).float() * 2.0 - 1.0
+            a_p, (oh, ow) = self._pad_to_multiple(a_n)
+            b_p, _ = self._pad_to_multiple(b_n)
+            preds = self._model(a_p, b_p)  # list of iterative predictions
+            flow = preds[-1][:, :, :oh, :ow]
         return flow.to(a.dtype)

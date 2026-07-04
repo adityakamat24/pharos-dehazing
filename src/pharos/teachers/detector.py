@@ -63,15 +63,24 @@ class DetectionTeacher:
         std = torch.tensor(_IMAGENET_STD, device=img.device).view(1, 3, 1, 1)
         return (img - mean) / std
 
-    @torch.no_grad()
     def __call__(self, img: torch.Tensor) -> list[torch.Tensor]:
-        """img: B,3,H,W float in [0,1]. Returns list of FPN feature maps (B,C,h,w)."""
+        """img: B,3,H,W float in [0,1]. Returns list of FPN feature maps (B,C,h,w).
+
+        NOTE: intentionally NOT @torch.no_grad() — the detection-consistency loss
+        backprops through this call into the student's output; callers wanting
+        gradient-free features (GT side) wrap the call in no_grad themselves.
+        The model's own parameters stay frozen (requires_grad=False at load).
+        """
         if not self._loaded:
             self._load()
         if not self.available or self._model is None:
             return []
-        x = self._normalize(img.to(self.device))
-        feats = self._model.backbone(x)  # OrderedDict of FPN maps
+        # fp32 island (may be called under the trainer's AMP autocast; note the
+        # detection-consistency loss also calls this WITH grad on the output).
+        dev_type = self.device.type if hasattr(self.device, "type") else "cuda"
+        with torch.autocast(device_type=dev_type, enabled=False):
+            x = self._normalize(img.to(self.device).float())
+            feats = self._model.backbone(x)  # OrderedDict of FPN maps
         return list(feats.values())
 
     # protocol alias used in some call sites / DESIGN §8
