@@ -100,7 +100,9 @@ def build_datasets(cfg: Any, names: list[str], split: str) -> list:
     )
     out = []
     for name in names:
-        if name in video_names:
+        # Only 'reveal_*' names belong to the reveal builder; other video sets
+        # (synth_video, revide) use the standard v1 factory.
+        if name in video_names and name.startswith("reveal"):
             build = _lazy(
                 "pharos.data.reveal_dataset", "build_reveal_dataset",
                 why="build_reveal_dataset yields the synthetic reveal video clips.",
