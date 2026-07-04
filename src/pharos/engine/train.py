@@ -107,7 +107,10 @@ def default_build_model(cfg: Config):
 
 
 def default_build_loss(cfg: Config):
-    return _construct(getattr(_import("pharos.losses"), "PharosLoss"), cfg, "loss")
+    # PharosLoss reads both cfg.loss and cfg.teachers — it must receive the full
+    # config tree. Passing only the loss section would make it silently fall back
+    # to default weights and detector every_n.
+    return getattr(_import("pharos.losses"), "PharosLoss")(cfg)
 
 
 def default_build_teachers(cfg: Config):
