@@ -1,0 +1,54 @@
+# Pharos base config (frozen contract: keys here are the canonical names;
+# experiments override via `_base_: base.yaml` files, not by editing this one).
+
+seed: 3407
+data_root: D:/dehazing_desmoking/data
+out_root: D:/dehazing_desmoking/runs
+
+model:
+  lowres: 256          # long side of low-res stream
+  enc_channels: [24, 48, 96, 96]
+  grid: {depth: 8, size: 16}     # D, Gh=Gw
+  detail: {channels: 12, layers: 4, scale_init: 0.05}
+  film_stages: [2, 3]
+  temporal: true       # ConvGRU state (video mode); image mode passes state=None
+  gate: {beta_lo: 0.15, beta_hi: 0.45}
+
+teachers:
+  depth: {name: depth_anything_v2_small, enabled: true}
+  detector: {name: yolov8n, enabled: true, every_n: 4}
+  flow: {name: raft_small, enabled: true}
+
+loss:
+  rec: 1.0
+  freq: 0.1
+  conf: 0.05
+  depth: 0.1
+  det: 0.05
+  temp: 0.5
+  phys: 0.1
+
+train:
+  crop: 256
+  batch: 12
+  clip_len: 3          # frames per temporal sample
+  clip_batch: 3
+  lr: 3.0e-4
+  weight_decay: 0.01
+  iters: 200000
+  warmup_iters: 2000
+  amp: true
+  ema: 0.999
+  ckpt_every: 2000
+  eval_every: 5000
+  num_workers: 4
+
+datasets:
+  train: [reside6k, smokebench, satehaze1k, synth_haze, synth_smoke, synth_satellite, clear_passthrough]
+  train_video: [revide, synth_video]
+  eval: [sots_mix, nhhaze, densehaze, smokebench_test, satehaze1k_test, rice1]
+  eval_noref: [rtts]
+
+bench:
+  resolutions: [[1280, 720], [1920, 1080], [3840, 2160]]
+  frames: 100
