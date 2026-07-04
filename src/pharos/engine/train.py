@@ -114,22 +114,15 @@ def default_build_loss(cfg: Config):
 
 
 def default_build_teachers(cfg: Config):
-    return _construct(getattr(_import("pharos.teachers.bundle"), "build_teachers"), cfg, "teachers")
+    # build_teachers reads cfg.teachers AND cfg.data_root (weights cache) — full tree.
+    return getattr(_import("pharos.teachers.bundle"), "build_teachers")(cfg)
 
 
 def default_build_datasets(cfg: Config, names: list[str], split: str) -> list:
+    # split must be passed explicitly: build_dataset defaults to 'train', which
+    # would silently give eval sets random crops/flips.
     build = getattr(_import("pharos.data"), "build_dataset")
-    out = []
-    for name in names:
-        for args, kw in (((name, cfg), {}), ((name,), {"split": split}), ((name,), {})):
-            try:
-                out.append(build(*args, **kw))
-                break
-            except TypeError:
-                continue
-        else:  # pragma: no cover
-            out.append(build(name))
-    return out
+    return [build(name, cfg, split=split) for name in names]
 
 
 @dataclass

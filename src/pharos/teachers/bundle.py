@@ -61,6 +61,17 @@ class TeacherBundle:
         return cls(depth=depth, detector=detector, flow=flow)
 
 
+def build_teachers(cfg: Any, device: str | torch.device | None = None) -> TeacherBundle:
+    """Factory used by the training engine (DESIGN §8 / engine Deps.build_teachers).
+
+    Accepts the full config tree (from_config reads cfg.teachers and cfg.data_root).
+    Teachers run on CUDA when available unless a device is given explicitly.
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    return TeacherBundle.from_config(cfg, device=device)
+
+
 def _get(obj: Any, key: str, default: Any = None) -> Any:
     if obj is None:
         return default

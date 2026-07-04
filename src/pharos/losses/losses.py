@@ -203,7 +203,7 @@ class PharosLoss:
 
         for key in ("beta", "airlight", "sigma"):
             pred = _get(deg, key, None)
-            target = _tensor_like(meta.get(key), pred, device)
+            target = _tensor_like(_meta_get(meta, key), pred, device)
             if pred is not None and target is not None:
                 loss = loss + (pred - target).abs().mean()
                 found = True
@@ -267,9 +267,29 @@ def _student_feats(out: PharosOutput) -> Optional[torch.Tensor]:
     return None
 
 
+def _meta_get(meta: Any, key: str) -> Any:
+    """Read a synthesis param from batch meta.
+
+    meta may be a single dict (pre-collated values) or a list of per-sample
+    dicts (the engine's collate keeps it as a list); the list form is stacked
+    into a B,* float tensor. None when the key is absent from any sample.
+    """
+    if isinstance(meta, dict):
+        return meta.get(key)
+    if isinstance(meta, (list, tuple)) and meta and all(isinstance(m, dict) for m in meta):
+        vals = [m.get(key) for m in meta]
+        if any(v is None for v in vals):
+            return None
+        try:
+            return torch.stack([torch.as_tensor(v, dtype=torch.float32).reshape(-1) for v in vals])
+        except Exception:
+            return None
+    return None
+
+
 def _scene_cut_weight(batch: dict, length: int, device) -> Optional[torch.Tensor]:
     meta = batch.get("meta") or {}
-    sc = _get(meta, "scene_cut", None)
+    sc = _meta_get(meta, "scene_cut")
     if sc is None:
         return None
     try:
