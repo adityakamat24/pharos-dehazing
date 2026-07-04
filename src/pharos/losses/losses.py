@@ -93,15 +93,22 @@ class PharosLoss:
     def _conf(self, out: PharosOutput, clean: Optional[torch.Tensor], device) -> torch.Tensor:
         if clean is None or out.confidence is None:
             return _z(device)
-        err = (out.output - clean).abs().mean(dim=1, keepdim=True)  # B,1,H,W
+        output = out.output
         aux = out.aux if isinstance(out.aux, dict) else {}
         logvar = aux.get("logvar")
+        conf5 = out.confidence
+        if output.dim() == 5:  # time-stacked clip batch -> flatten to B*T
+            output = output.flatten(0, 1)
+            clean = clean.flatten(0, 1) if clean.dim() == 5 else clean
+            logvar = logvar.flatten(0, 1) if logvar is not None and logvar.dim() == 5 else logvar
+            conf5 = conf5.flatten(0, 1) if conf5.dim() == 5 else conf5
+        err = (output - clean).abs().mean(dim=1, keepdim=True)  # B,1,H,W
         if logvar is not None:
             lv = logvar.clamp(-6.0, 3.0)
             if lv.shape[-2:] != err.shape[-2:]:
                 lv = F.interpolate(lv, size=err.shape[-2:], mode="bilinear", align_corners=False)
             return (err * torch.exp(-lv) + lv).mean()
-        conf = out.confidence
+        conf = conf5
         if conf.shape[-2:] != err.shape[-2:]:
             conf = F.interpolate(conf, size=err.shape[-2:], mode="bilinear", align_corners=False)
         p = conf.clamp(self.conf_eps, 1.0)
@@ -149,7 +156,8 @@ class PharosLoss:
     # L_det — L1 between detector FPN feats on J vs clean (every_n-th call only).
     def _det(self, out: PharosOutput, batch: dict, teachers: Any, device) -> torch.Tensor:
         det_fn = _get(teachers, "detector", None)
-        clean = _match_clean(batch.get("clean"), out.output)
+        output = out.output[:, -1] if out.output.dim() == 5 else out.output  # last frame for clips
+        clean = _match_clean(batch.get("clean"), output)
         if det_fn is None or clean is None:
             return _z(device)
         self._det_counter += 1
@@ -157,7 +165,7 @@ class PharosLoss:
             return _z(device)
         with torch.no_grad():
             feats_gt = det_fn(clean)
-        feats_j = det_fn(out.output)
+        feats_j = det_fn(output)
         if not feats_j or not feats_gt:
             return _z(device)
         loss = _z(device)
@@ -205,6 +213,8 @@ class PharosLoss:
         return loss
 
     # L_phys — supervised beta/airlight/sigma (L1) + domain (CE), when present.
+    # Clip batches arrive time-stacked from the engine (deg values B,T,k,
+    # domain_logits B,T,3); per-sample targets apply to every frame.
     def _phys(self, out: PharosOutput, batch: dict, device) -> torch.Tensor:
         deg = out.deg or {}
         meta = batch.get("meta") or {}
@@ -213,15 +223,24 @@ class PharosLoss:
 
         for key in ("beta", "airlight", "sigma"):
             pred = _get(deg, key, None)
-            target = _tensor_like(_meta_get(meta, key), pred, device)
-            if pred is not None and target is not None:
-                loss = loss + (pred - target).abs().mean()
+            if pred is None:
+                continue
+            t_frames = pred.shape[1] if pred.dim() == 3 else 1
+            flat = pred.reshape(-1, pred.shape[-1]) if pred.dim() == 3 else pred
+            target = _tensor_like(_meta_get(meta, key), flat[:: t_frames or 1], device)
+            if target is not None:
+                if t_frames > 1:
+                    target = target.repeat_interleave(t_frames, dim=0)
+                loss = loss + (flat - target).abs().mean()
                 found = True
 
         logits = _get(deg, "domain_logits", None)
         domain = batch.get("domain")
         if logits is not None and domain is not None:
             dom = domain.to(device).long().view(-1)
+            if logits.dim() == 3:  # B,T,3 -> B*T,3 with per-frame targets
+                dom = dom.repeat_interleave(logits.shape[1])
+                logits = logits.reshape(-1, logits.shape[-1])
             if dom.numel() == logits.shape[0]:
                 loss = loss + F.cross_entropy(logits, dom)
                 found = True
