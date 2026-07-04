@@ -183,6 +183,21 @@ Rules for implementers: own only your directories; never edit `contracts.py`/`co
 teachers, or datasets present; add unit tests (CPU, tiny tensors) for your code; match repo style;
 commit to your branch `ws/<name>`.
 
+## 9b. Known deviations (post-implementation review)
+
+- **HDRNet dual-stream training is not wired**: datasets provide `meta["full_lowres"]`
+  (global downsampled context) but `PharosNet.forward` predicts the grid from the crop's
+  own low-res stream. At inference the full frame feeds the low-res stream, so behavior is
+  correct; during crop training the grid just sees less global context. Wiring
+  `full_lowres` into the low-res encoder path is a planned improvement (needs a forward
+  kwarg, not a contract break).
+- **Two `pharos_collate` implementations exist** (engine/train.py and data/datasets.py);
+  the engine uses its own, meta stays a list of per-sample dicts and losses normalize via
+  `_meta_get`. Consolidate later.
+- **Eager-mode speed** on the RTX 3060 Laptop (55W): 29 FPS @720p / 22 FPS @1080p fp16
+  model-only. FP16 ≈ FP32 ⇒ launch/bandwidth-bound; ONNX-Runtime/TensorRT export is the
+  planned path to the ≥30 FPS @1080p target (M7).
+
 ## 10. Milestones
 
 M1 skeleton+contracts (lead) → M2 parallel workstreams (Opus, worktrees) → M3 merge + review + fix →
