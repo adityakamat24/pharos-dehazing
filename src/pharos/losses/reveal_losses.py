@@ -123,22 +123,26 @@ class RevealLoss:
             if hazy is None or hazy.dim() != 5:
                 return _z(device)
             hh, ww = int(hazy.shape[-2]), int(hazy.shape[-1])
-            s = torch.tensor(
-                [[2.0 / ww, 0.0, -1.0], [0.0, 2.0 / hh, -1.0], [0.0, 0.0, 1.0]], device=device
-            )
-            s_inv = torch.linalg.inv(s)
-            rel = h_gt[:, 1:] @ torch.linalg.inv(h_gt[:, :-1])          # B,T-1,3,3 (pixel)
-            rel_n = s @ rel @ s_inv                                     # normalized coords
-            off_e = homography_to_4pt(h_est.reshape(-1, 3, 3), self.eps)
-            off_g = homography_to_4pt(rel_n.reshape(-1, 3, 3), self.eps)
-            off_gi = homography_to_4pt(
-                torch.linalg.inv(rel_n).reshape(-1, 3, 3), self.eps
-            )
-            # convention-robust: the aligner's warp direction may be either
-            # prev->cur or cur->prev; supervise against the closer one.
-            l_fwd = (off_e - off_g).abs().mean()
-            l_bwd = (off_e - off_gi).abs().mean()
-            return torch.minimum(l_fwd, l_bwd)
+            # fp32 island: under AMP autocast matmuls emit Half and linalg.inv
+            # rejects low-precision dtypes.
+            dev_type = device.type if hasattr(device, "type") else "cuda"
+            with torch.autocast(device_type=dev_type, enabled=False):
+                s = torch.tensor(
+                    [[2.0 / ww, 0.0, -1.0], [0.0, 2.0 / hh, -1.0], [0.0, 0.0, 1.0]], device=device
+                )
+                s_inv = torch.linalg.inv(s)
+                rel = h_gt.float()[:, 1:] @ torch.linalg.inv(h_gt.float()[:, :-1])  # B,T-1,3,3 px
+                rel_n = s @ rel @ s_inv                                             # normalized
+                off_e = homography_to_4pt(h_est.float().reshape(-1, 3, 3), self.eps)
+                off_g = homography_to_4pt(rel_n.reshape(-1, 3, 3), self.eps)
+                off_gi = homography_to_4pt(
+                    torch.linalg.inv(rel_n).reshape(-1, 3, 3), self.eps
+                )
+                # convention-robust: the aligner's warp direction may be either
+                # prev->cur or cur->prev; supervise against the closer one.
+                l_fwd = (off_e - off_g).abs().mean()
+                l_bwd = (off_e - off_gi).abs().mean()
+                return torch.minimum(l_fwd, l_bwd)
         he = h_est.reshape(-1, 3, 3)
         hg = h_gt.reshape(-1, 3, 3)
         if he.shape[0] != hg.shape[0]:
