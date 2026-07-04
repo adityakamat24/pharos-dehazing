@@ -1,0 +1,14 @@
+# Full training as run on the vast.ai pod (RTX 4090, 2026-07-04).
+_base_: full.yaml
+exp_name: full
+
+data_root: /workspace/data
+out_root: /workspace/runs
+
+train:
+  eval_every: 10000    # full eval sets are expensive; 20 evals across the run
+
+datasets:
+  # RTTS is behind a non-scriptable Box link; no-ref eval runs post-hoc once
+  # RTTS is fetched manually.
+  eval_noref: []
