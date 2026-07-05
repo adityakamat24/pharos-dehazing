@@ -164,12 +164,17 @@ def load_model(
         # The engine's EMA saves an envelope {"decay": float, "shadow": {param: tensor}}.
         if "shadow" in state and isinstance(state["shadow"], dict):
             state = state["shadow"]
+        # RevealNet checkpoints wrap the restorer under an 'inner.' prefix; strip it
+        # so the backbone loads into a bare PharosNet.
+        if any(k.startswith("inner.") for k in state):
+            state = {k[len("inner."):]: v for k, v in state.items() if k.startswith("inner.")}
         missing, unexpected = model.load_state_dict(state, strict=False)  # type: ignore[union-attr]
         n_params = sum(1 for _ in model.state_dict())  # type: ignore[union-attr]
-        if missing and len(missing) >= n_params:
+        if missing and len(missing) > n_params // 2:
             raise ValueError(
-                f"load_model: no checkpoint keys matched the model ({len(unexpected)} unexpected); "
-                f"refusing to run with untrained weights. Checkpoint keys: {sorted(ckpt)[:8]}"
+                f"load_model: only {n_params - len(missing)}/{n_params} model keys matched the "
+                f"checkpoint ({len(unexpected)} unexpected); refusing to run mostly-untrained "
+                f"weights. Checkpoint keys: {sorted(ckpt)[:8]}"
             )
         if missing or unexpected:
             warnings.warn(
