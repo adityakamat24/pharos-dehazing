@@ -46,6 +46,11 @@ class VividLoss:
             "lpips": float(_get(vivid, "lpips", 0.3)),
             "gan": float(_get(vivid, "gan", 0.02)),
             "conf": float(_get(vivid, "conf", 0.05)),
+            # Physics anchor: without it the degradation head drifts unmoored,
+            # beta-hat collapses below the gate floor and the severity gate
+            # silently discards the (perfectly good) restoration — measured on
+            # both vivid runs (beta 0.33 -> 0.146, alpha -> 0.000, out == input).
+            "phys": float(_get(vivid, "phys", 0.1)),
         }
         self.gan_warmup = int(_get(vivid, "gan_warmup", 2000))
         self.disc_lr = float(_get(vivid, "disc_lr", 1e-4))
@@ -103,8 +108,10 @@ class VividLoss:
         lpips_v = self._lpips_term(out_last, clean_last, device)
         gan = self._gen_gan(out_last, clean_last, cond, device) if (have_pair and w_gan > 0.0) else _z(device)
         conf = self._conf_term(out, out_last, clean_last, logvar_last, device)
+        phys = self._pharos._phys(out, batch, device) if self.w["phys"] > 0 else _z(device)
 
-        total = self.w["l1"] * l1 + self.w["lpips"] * lpips_v + w_gan * gan + self.w["conf"] * conf
+        total = (self.w["l1"] * l1 + self.w["lpips"] * lpips_v + w_gan * gan
+                 + self.w["conf"] * conf + self.w["phys"] * phys)
 
         self._step += 1
         log = {
@@ -112,6 +119,7 @@ class VividLoss:
             "lpips": float(lpips_v.detach()),
             "gan": float(gan.detach()),
             "conf": float(conf.detach()),
+            "phys": float(phys.detach()),
             "d": float(d_val),
             "gan_w": float(w_gan),
             "total": float(total.detach()),
