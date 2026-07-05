@@ -1,8 +1,11 @@
 """Integration tests for RevealNet over the real PharosNet (WS-v2A, DESIGN.md §9d)."""
+import dataclasses
+import math
 import pathlib
 import sys
 
 import torch
+import torch.nn as nn
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -144,6 +147,108 @@ def test_reveal_cfg_overrides_are_applied():
     assert net.mem_res == 64
     assert net.cfg["half_life"] == 5.0
     assert net.seed_trust == 0.25
+
+
+class _StubAligner(nn.Module):
+    """Injects a scripted per-frame homography with full trust (isolates memory)."""
+
+    def __init__(self, homographies: list[torch.Tensor]) -> None:
+        super().__init__()
+        self._hs = homographies
+        self._i = 0
+
+    def forward(self, cur, anchor, motion_prior=None):
+        h = self._hs[self._i]
+        self._i += 1
+        b, _, hf, wf = cur.shape
+        return h, torch.ones(b, 1, hf, wf), torch.ones(b, 1)
+
+
+def _trans(tx: float) -> torch.Tensor:
+    h = torch.eye(3).unsqueeze(0)
+    h[0, 0, 2] = tx
+    return h
+
+
+def test_panning_camera_margin_recall():
+    """Panning camera + moving occluder: content seen early and occluded at the end is
+    recalled from the anchor buffer margin far better than the no-memory baseline.
+
+    The target region is only ever visible AFTER the camera pans (it lies outside the
+    frame-0 anchor view), so recall depends on the ``anchor_margin`` retaining it. The
+    aligner's homography is injected (translation-only) to isolate memory correctness
+    from aligner quality; confidence is stubbed honest (low under the black occluder)
+    and the inner restoration is identity so the memory contribution is measurable.
+    """
+    torch.manual_seed(0)
+    net = RevealNet(
+        PharosNet(load_config(CFG_PATH).model),
+        {"anchor_margin": 2.0, "reanchor_px": 10.0, "decay_keep": 0.995, "merge_thresh": 0.05},
+    ).eval()
+
+    v = 48
+    world = torch.rand(1, 3, v, 96)
+
+    def ox(t: int) -> int:
+        return min(2 * t, 24)
+
+    def txc(t: int) -> float:
+        return -2.0 * ox(t) / (v - 1)
+
+    hs, prev = [], txc(0)
+    for t in range(1, 31):
+        hs.append(_trans(txc(t) - prev))
+        prev = txc(t)
+    net.aligner = _StubAligner(hs)
+
+    # honest, high confidence outside the occluder; identity inner restoration.
+    orig = net.inner.forward
+
+    def inner_id(frame, *a, **k):
+        out = orig(frame, *a, **k)
+        visible = (frame.abs().amax(dim=1, keepdim=True) > 1e-3).float()
+        conf = (0.05 + 0.9 * visible).clamp(0.0, 1.0)
+        return dataclasses.replace(out, output=frame, confidence=conf)
+
+    net.inner.forward = inner_id
+
+    occ = (slice(None), slice(None), slice(None), slice(24, 40))  # occluder over target
+    state = None
+    with torch.no_grad():
+        for t in range(31):
+            frame = world[:, :, :, ox(t):ox(t) + v].clone()
+            if t == 30:
+                frame[occ] = 0.0                                  # occlude the target now
+            out = net(frame, state=state)
+            state = out.state
+
+    gt = world[:, :, :, ox(30):ox(30) + v]
+    comp, base = out.output, out.aux["j_restored"]
+
+    def psnr(x: torch.Tensor) -> float:
+        mse = ((x[occ] - gt[occ]) ** 2).mean().item()
+        return 10.0 * math.log10(1.0 / max(mse, 1e-12))
+
+    assert psnr(comp) > psnr(base) + 6.0, (psnr(comp), psnr(base))   # memory recall wins
+    assert float(out.aux["memory_trust"][occ].mean()) > 0.5
+
+
+def test_reanchor_counts_on_large_drift():
+    """A large injected pan drives cumulative drift past reanchor_px -> aux stat counts it."""
+    torch.manual_seed(0)
+    net = RevealNet(
+        PharosNet(load_config(CFG_PATH).model), {"reanchor_px": 0.2, "align_res": 32}
+    ).eval()
+    net.aligner = _StubAligner([_trans(0.9), _trans(0.0)])   # frame1 big pan -> rebase
+    state = None
+    counts = []
+    with torch.no_grad():
+        for _ in range(3):
+            out = net(torch.rand(1, 3, 48, 48), state=state)
+            state = out.state
+            counts.append(float(out.aux["reanchors"].sum()))
+    assert counts[0] == 0.0                                   # frame 0: seed, no aligner
+    assert sum(counts) >= 1.0, counts                         # at least one re-anchor fired
 
 
 def test_satisfies_pharos_model_contract():

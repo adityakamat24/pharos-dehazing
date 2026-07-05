@@ -38,6 +38,9 @@ _DEFAULTS: dict[str, Any] = {
     "comp_k": 8.0,         # compositor sigmoid sharpness
     "seed_trust": 0.1,     # first-frame memory trust
     "aligner_width": 24,   # aligner base channel width
+    "reanchor_px": 0.35,   # re-anchor when cumulative corner drift exceeds this frac
+    "rebase_decay": 0.9,   # trust multiplier applied on a re-anchor
+    "anchor_margin": 1.5,  # anchor buffer size as a multiple of the mid-res view
 }
 
 
@@ -60,6 +63,7 @@ class RevealNet(nn.Module):
         self.align_res = int(self.cfg["align_res"])
         self.seed_trust = float(self.cfg["seed_trust"])
         self.dt = float(self.cfg["dt"])
+        self.anchor_margin = float(self.cfg["anchor_margin"])
         self.aligner = TieredAligner(
             in_ch=3, width=int(self.cfg["aligner_width"]), t_lo=float(self.cfg["t_lo"])
         )
@@ -96,26 +100,32 @@ class RevealNet(nn.Module):
         j_mid = self._resize(j, (mh, mw))
         conf_mid = self._resize(conf, (mh, mw))
 
+        reanchors = 0
         if not isinstance(state, dict):
             # First frame: seed memory from the current restoration at low trust.
-            memory = RevealMemory.seed(j_mid, self.seed_trust)
+            memory = RevealMemory.seed(j_mid, self.seed_trust, margin=self.anchor_margin)
             align_full = torch.zeros_like(conf)
             homog = None
         else:
             memory: RevealMemory = state["memory"]
             homog, tmap, scalar = self.aligner(cur_lr, state["anchor"], motion_prior)
-            memory.warp(homog)                                     # register into current view
+            memory.compose(homog)                                  # cumulative anchor->current
+            reanchors = memory.maybe_reanchor(self.cfg, scalar)    # rare single-resample rebase
             align_mid = self._resize(tmap, (mh, mw)) * scalar.view(-1, 1, 1, 1)
             memory.update(j_mid, conf_mid, align_mid, self.cfg, dt=self.dt)
             align_full = self._resize(tmap * scalar.view(-1, 1, 1, 1), (h, w))
 
-        out, staleness = composite(j, conf, memory, self.cfg)
+        view = memory.read_view()                                  # anchor -> current view (read)
+        out, staleness = composite(j, conf, view, self.cfg)
 
         aux = dict(inner_out.aux)
         aux["staleness"] = staleness
-        aux["memory_trust"] = self._resize(memory.trust, (h, w))
+        aux["memory_trust"] = self._resize(view.trust, (h, w))     # current-view read-path trust
         aux["align_trust"] = align_full
         aux["j_restored"] = j
+        aux["reanchors"] = torch.full(
+            (frame.shape[0],), float(reanchors), device=frame.device
+        )  # aux stat: re-anchor count this frame (per-batch scalar)
         if homog is not None:
             aux["align_H"] = homog  # estimated 3x3 homography (RevealLoss L_align supervision)
         new_state = {"inner": inner_out.state, "memory": memory, "anchor": cur_lr}
