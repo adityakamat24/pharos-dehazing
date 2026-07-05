@@ -72,6 +72,12 @@ class _PharosDataset(Dataset):
     lowres: int = 256
     seed: int | None = None
     name: str = "dataset"
+    # Camera-realism degradations (JPEG/blockiness/ISO noise) applied to the
+    # INPUT only. Real deployment footage (CCTV smoke) carries compression
+    # artifacts under the haze; training on clean-camera inputs makes the model
+    # amplify blocks into mud. Set by build_dataset for real paired sets when
+    # cfg datasets.robustness_real is true (SyntheticDataset has its own path).
+    input_robustness: Any = None
 
     def _gen(self, idx: int) -> torch.Generator | None:
         if self.seed is None:
@@ -86,6 +92,9 @@ class _PharosDataset(Dataset):
         meta: dict,
         generator: torch.Generator | None,
     ) -> dict:
+        # degrade the input BEFORE the lowres stream so both views match the camera
+        if self.input_robustness is not None:
+            hazy = self.input_robustness(hazy, generator)
         # global-context lowres stream computed from the *full* image (pre-crop)
         meta = dict(meta)
         meta["full_lowres"] = make_lowres(hazy, self.lowres)
@@ -716,13 +725,21 @@ def _build_dataset_impl(name: str, cfg: Any, split: str = "train") -> Dataset:
     use_crop = crop if is_train else 0
     augment = is_train
 
+    real_robustness = (
+        RobustnessPipeline()
+        if is_train and bool(_cfg_get(cfg, "datasets.robustness_real", False))
+        else None
+    )
+
     def _make_paired(hdir: Path, cdir: Path | None, match: str, domain: int, nm: str) -> Dataset:
         # single-dir suffix layout keeps its mode; two-dir layouts use robust auto-match
         eff = "suffix" if cdir is None else "auto"
-        return PairedFolderDataset(
+        ds = PairedFolderDataset(
             hdir, cdir, domain=domain, match=eff, recursive=(cdir is None),
             crop=use_crop, augment=augment, lowres=lowres, seed=seed, name=nm,
         )
+        ds.input_robustness = real_robustness
+        return ds
 
     def _concat_recursive(root: Path, split_kind: str, domain: int, nm: str) -> Dataset | None:
         pairs = _recursive_paired(root, split_kind)
