@@ -83,7 +83,12 @@ def build_model(cfg: Any) -> Any:
             # this, clip-heavy reveal training drifts the backbone (observed:
             # SmokeBench 20.7->18.7 by step 5k).
             n_frozen = 0
-            for p in base.parameters():
+            for name, p in base.named_parameters():
+                # conf_head stays trainable: the frozen confidence is miscalibrated
+                # out-of-domain (reports ~0.95 under dense synthetic smoke), which
+                # starves the memory arbitration. Restoration stays frozen.
+                if reveal_cfg.get("train_conf_head", True) and name.startswith("conf_head"):
+                    continue
                 p.requires_grad = False
                 n_frozen += 1
             # Pin eval mode: Trainer calls model.train() every step, which would

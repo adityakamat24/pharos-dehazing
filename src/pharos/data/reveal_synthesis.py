@@ -102,8 +102,14 @@ def _camera_walk(
     """
     out = torch.empty(max(t, 1), 3, 3, device=device, dtype=dtype)
     out[0] = torch.eye(3, device=device, dtype=dtype)
-    # AR(1) velocity per DOF: v <- momentum*v + (1-momentum)*noise
+    # Ornstein-Uhlenbeck pose: AR(1) velocity plus a spring pulling the cumulative
+    # pose back toward identity. A pure velocity walk lets POSITION drift without
+    # bound (measured 250-500px over T=32 — the scene left the frame entirely,
+    # making long-horizon memory impossible by construction). Real handheld shake
+    # oscillates around a viewpoint; so does this.
+    spring = 0.25
     vel = torch.zeros(6, device=device, dtype=dtype)
+    pos = torch.zeros(6, device=device, dtype=dtype)
     accum = out[0].clone()
     for i in range(1, t):
         noise = torch.tensor(
@@ -118,7 +124,8 @@ def _camera_walk(
             device=device,
             dtype=dtype,
         )
-        vel = momentum * vel + (1.0 - momentum) * noise
+        vel = momentum * vel + (1.0 - momentum) * noise - spring * pos
+        pos = pos + vel
         step = _step_homography(
             h,
             w,
