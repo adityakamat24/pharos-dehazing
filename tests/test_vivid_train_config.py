@@ -1,4 +1,4 @@
-"""Tests: vivid.yaml loads through pharos.config; train_vivid launcher wiring."""
+﻿"""Tests: vivid.yaml loads through pharos.config; train_vivid launcher wiring."""
 from __future__ import annotations
 
 import importlib.util
@@ -58,7 +58,7 @@ def test_launcher_build_loss_returns_vivid_loss():
 
     assert isinstance(loss, VividLoss)
     assert callable(loss)
-    assert loss.w == {"l1": 1.0, "lpips": 0.3, "gan": 0.02, "conf": 0.05}
+    assert loss.w == {"l1": 1.0, "lpips": 0.3, "gan": 0.02, "conf": 0.05, "phys": 0.1}
     assert loss.gan_warmup == 2000
     assert loss.disc_lr == 1.0e-4
 
@@ -80,3 +80,4 @@ def test_launcher_make_deps_wires_factories():
     from pharos.engine.train import default_build_datasets
 
     assert deps.build_datasets is default_build_datasets
+
