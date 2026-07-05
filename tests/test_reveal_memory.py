@@ -114,3 +114,114 @@ def test_composite_prefers_current_when_memory_untrusted():
     conf = torch.ones(1, 1, 16, 16)
     out, _ = composite(j, conf, mem, CFG)
     assert float(out.mean()) < 0.1              # current restoration (zeros) dominates
+
+
+# ---------------------------------------------------------------------------
+# v2.1 anchor-frame regression tests
+# ---------------------------------------------------------------------------
+def _trans(tx: float) -> torch.Tensor:
+    """Pure horizontal-translation homography (normalized coords)."""
+    h = torch.eye(3).unsqueeze(0)
+    h[0, 0, 2] = tx
+    return h
+
+
+def test_long_horizon_no_blur_invariance():
+    """DECISIVE: static scene + identity camera for T=40 must NOT accumulate blur.
+
+    The v2.0 design re-warped the buffer in place every frame (N frames = N bilinear
+    resamples -> mush). The anchor-frame design resamples only the fresh observation,
+    so the buffer converges to the (single) observation and stays there. Buffer must
+    stay within 1e-3 of the constant observation after 40 high-confidence updates.
+    """
+    torch.manual_seed(0)
+    obs = torch.rand(1, 3, 16, 16)
+    mem = RevealMemory.seed(obs, seed_trust=0.5, margin=1.0)   # no margin -> exact
+    assert float((mem.rgb - obs).abs().max()) < 1e-3          # seed is a clean copy
+    for _ in range(40):
+        mem.compose(torch.eye(3).unsqueeze(0))                # identity camera
+        mem.update(obs, torch.ones(1, 1, 16, 16), torch.ones(1, 1, 16, 16), CFG, dt=1.0)
+    assert float((mem.rgb - obs).abs().max()) < 1e-3, float((mem.rgb - obs).abs().max())
+    assert float((mem.read_view().rgb - obs).abs().max()) < 1e-3
+
+
+def test_buffer_is_not_resampled_each_frame():
+    """Anchor buffer identity: the stored buffer never changes under an identity camera.
+
+    Contrast with the old design where each frame re-warped the buffer; here the buffer
+    tensor is bit-stable across frames (only the fresh observation is resampled).
+    """
+    torch.manual_seed(1)
+    obs = torch.rand(1, 3, 12, 12)
+    mem = RevealMemory.seed(obs, seed_trust=0.5, margin=1.0)
+    snap = mem.rgb.clone()
+    for _ in range(20):
+        mem.compose(torch.eye(3).unsqueeze(0))
+        mem.update(obs, torch.ones(1, 1, 12, 12), torch.ones(1, 1, 12, 12), CFG)
+    assert float((mem.rgb - snap).abs().max()) < 1e-3
+
+
+def test_panning_margin_recall_and_necessity():
+    """Panning translation + margin: off-anchor-view content is stored and recalled.
+
+    A target region lives OUTSIDE the frame-0 (anchor) view and is only ever seen after
+    the camera pans. With ``margin >= 2`` the anchor buffer covers it (near-exact recall,
+    high trust); with ``margin == 1`` those writes fall outside the buffer and are
+    dropped (no recall). Aligner homographies are injected (translation-only) to isolate
+    memory correctness from aligner quality.
+    """
+    torch.manual_seed(0)
+    v = 48
+    world = torch.rand(1, 3, v, 96)
+    cfg = {**CFG, "reanchor_px": 10.0, "decay_keep": 0.995}   # disable rebase for isolation
+
+    def ox(t: int) -> int:
+        return min(2 * t, 24)
+
+    def txc(t: int) -> float:
+        return -2.0 * ox(t) / (v - 1)                          # cumulative anchor->cur
+
+    def run(margin: float):
+        mem = RevealMemory.seed(world[:, :, :, 0:v], 0.3, margin=margin)
+        prev = txc(0)
+        for t in range(1, 31):
+            frame = world[:, :, :, ox(t):ox(t) + v]
+            mem.compose(_trans(txc(t) - prev))                # frame-to-frame delta
+            prev = txc(t)
+            mem.update(frame, torch.ones(1, 1, v, v), torch.ones(1, 1, v, v), cfg)
+        view = mem.read_view()
+        gt = world[:, :, :, 50:58]                            # world cols 50..58
+        recall = view.rgb[:, :, :, 26:34]                     # same cols in the frame-30 view
+        return (recall - gt).abs().mean().item(), view.trust[:, :, :, 26:34].mean().item()
+
+    err_big, trust_big = run(2.0)
+    err_none, trust_none = run(1.0)
+    assert err_big < 5e-3 and trust_big > 0.5, (err_big, trust_big)   # exact recall w/ margin
+    assert err_none > 5 * err_big and trust_none < 0.1, (err_none, trust_none)  # margin matters
+
+
+def test_maybe_reanchor_counts_and_recenters_on_drift():
+    """Large cumulative drift triggers a single-resample re-anchor: count>0, H->identity."""
+    torch.manual_seed(2)
+    mem = RevealMemory.seed(torch.rand(1, 3, 24, 24), 0.5, margin=1.5)
+    mem.compose(_trans(0.8))                                   # big pan -> corner drift > 0.7
+    n = mem.maybe_reanchor(CFG, torch.ones(1, 1))              # high trust, drift triggers
+    assert n == 1
+    assert torch.allclose(mem.H, torch.eye(3).unsqueeze(0), atol=1e-5)   # reset to identity
+
+
+def test_maybe_reanchor_on_trust_collapse():
+    """Alignment-trust collapse (< t_lo) triggers a re-anchor even without drift."""
+    mem = RevealMemory.seed(torch.rand(1, 3, 20, 20), 0.6, margin=1.5)
+    trust0 = mem.trust.clone()
+    n = mem.maybe_reanchor({**CFG, "t_lo": 0.2, "rebase_decay": 0.9}, torch.zeros(1, 1))
+    assert n == 1
+    assert float(mem.trust.max()) <= float(trust0.max()) + 1e-6   # trust decayed by rebase
+
+
+def test_detach_detaches_buffers_and_H():
+    rgb = torch.rand(1, 3, 8, 8, requires_grad=True)
+    mem = RevealMemory(rgb, torch.rand(1, 1, 8, 8), torch.zeros(1, 1, 8, 8))
+    mem.H = mem.H.clone().requires_grad_(True)
+    d = mem.detach()
+    assert not d.rgb.requires_grad and not d.H.requires_grad
