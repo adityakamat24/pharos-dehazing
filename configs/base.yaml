@@ -26,7 +26,19 @@ loss:
   depth: 0.1
   det: 0.05
   temp: 0.5
-  phys: 0.1
+  phys: 0.1            # covers beta AND beta_bs supervision
+  csf_freq: true       # CSF-weight the FFT-amplitude L_freq (mid-frequency peak)
+  jnd_rec: true        # JND-weight the Charbonnier L_rec (perceptual masking)
+  jnd_scale: 1.0       # w = 1 / (1 + jnd_scale * JND_norm)
+
+# On-the-fly degradation synthesis (pharos/data/synthesis.py). Wired into the
+# synthetic datasets; all keys backward-compatible.
+synthesis:
+  smoke_mode: mix      # perlin | turbulent | mix (source-point curl-noise smoke, 50/50)
+  isp_aware: true      # inject haze pre-ISP (linear ASM + Poisson shot noise) then re-gamma
+  isp_gamma: 2.2
+  shot_photons: [40.0, 300.0]   # Poisson photon-count range (lower => noisier)
+  beta_bs_ratio: [0.8, 1.3]     # backscatter beta = attenuation beta * U(lo,hi) in turbulent/ISP
 
 train:
   crop: 256

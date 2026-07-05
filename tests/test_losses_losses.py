@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from pharos.contracts import PharosOutput
 from pharos.losses import PharosLoss
+from pharos.losses import losses as L
 
 B, H, W = 2, 32, 32
 GD, GS = 8, 16  # grid depth, grid size
@@ -151,3 +152,86 @@ def test_missing_aux_uses_grid_fallback_for_depth():
     total, log = loss(_image_output(with_aux=False), _image_batch(), teachers)
     assert math.isfinite(float(total))
     assert log["depth"] >= 0.0  # falls back to pooled grid, no crash
+
+
+# ---------------------------------------------------------------------------
+# item 3 — CSF-weighted L_freq
+# ---------------------------------------------------------------------------
+def test_csf_mask_shape_and_midband_peak():
+    loss = PharosLoss(_cfg())
+    h, w = 32, 32
+    m = loss._csf_mask(h, int(w), torch.device("cpu"), torch.float32)
+    assert m.shape == (1, 1, h, w // 2 + 1)
+    assert abs(float(m.max()) - 1.0) < 1e-5      # normalized to peak 1
+    assert float(m[0, 0, 0, 0]) < 0.5            # DC strongly down-weighted
+    # peak sits at a mid radial frequency (not DC, not Nyquist corner)
+    idx = int(m.flatten().argmax())
+    r, c = divmod(idx, w // 2 + 1)
+    fy = float(torch.fft.fftfreq(h)[r])
+    fx = float(torch.fft.rfftfreq(w)[c])
+    radius = (fy * fy + fx * fx) ** 0.5 / 0.5
+    assert 0.15 < radius < 0.85, radius
+
+
+def test_csf_freq_toggle_changes_loss_but_both_finite():
+    out, batch = _image_output(), _image_batch()
+    teachers = _Teachers(None, None, None)
+    on = PharosLoss(_cfg())                       # csf_freq default True
+    cfg_off = _cfg()
+    cfg_off["loss"]["csf_freq"] = False
+    off = PharosLoss(cfg_off)
+    lo_on = on(out, batch, teachers)[1]["freq"]
+    lo_off = off(out, batch, teachers)[1]["freq"]
+    assert math.isfinite(lo_on) and math.isfinite(lo_off)
+    assert lo_on != lo_off                        # CSF actually reweights
+
+
+# ---------------------------------------------------------------------------
+# item 4 — JND-weighted L_rec
+# ---------------------------------------------------------------------------
+def test_jnd_weight_range():
+    clean = torch.rand(B, 3, H, W)
+    w = L._jnd_weight(clean, jnd_scale=1.0)
+    assert w.shape == (B, 1, H, W)
+    # jnd_scale=1 with JND normalized to [0,1] -> weights in [0.5, 1]
+    assert float(w.min()) >= 0.5 - 1e-4 and float(w.max()) <= 1.0 + 1e-4
+
+
+def test_jnd_rec_reduces_to_plain_charbonnier_when_off():
+    cfg_off = _cfg()
+    cfg_off["loss"]["jnd_rec"] = False
+    loss = PharosLoss(cfg_off)
+    out, batch = _image_output(), _image_batch()
+    rec = loss._rec(out, batch["clean"], torch.device("cpu"))
+    plain = torch.sqrt((out.output - batch["clean"]) ** 2 + loss.charb_eps ** 2).mean()
+    assert torch.allclose(rec, plain, atol=1e-7)
+
+
+def test_jnd_rec_on_is_finite_and_differs():
+    on, off_cfg = PharosLoss(_cfg()), _cfg()
+    off_cfg["loss"]["jnd_rec"] = False
+    off = PharosLoss(off_cfg)
+    out, batch = _image_output(), _image_batch()
+    r_on = on._rec(out, batch["clean"], torch.device("cpu"))
+    r_off = off._rec(out, batch["clean"], torch.device("cpu"))
+    assert math.isfinite(float(r_on)) and float(r_on) != float(r_off)
+
+
+# ---------------------------------------------------------------------------
+# item 5 — split backscatter beta supervision
+# ---------------------------------------------------------------------------
+def test_phys_supervises_beta_bs():
+    loss = PharosLoss(_cfg())
+    deg = _deg()
+    deg["beta_bs"] = torch.rand(B, 1)
+    out = PharosOutput(
+        output=torch.rand(B, 3, H, W), confidence=torch.rand(B, 1, H, W).clamp(0.05, 1.0),
+        grid=torch.rand(B, 12, GD, GS, GS), state=None, deg=deg, aux={},
+    )
+    meta = {"beta": torch.rand(B), "beta_bs": torch.rand(B), "airlight": torch.rand(B, 3),
+            "sigma": torch.rand(B)}
+    with_bs = loss._phys(out, {"meta": meta, "domain": torch.randint(0, 3, (B,))}, torch.device("cpu"))
+    # dropping beta_bs from meta must lower the phys loss (one fewer supervised term)
+    meta_no = {k: v for k, v in meta.items() if k != "beta_bs"}
+    without_bs = loss._phys(out, {"meta": meta_no, "domain": torch.randint(0, 3, (B,))}, torch.device("cpu"))
+    assert math.isfinite(float(with_bs)) and float(with_bs) != float(without_bs)

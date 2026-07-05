@@ -37,6 +37,11 @@ class PharosLoss:
         det_cfg = _get(_get(cfg, "teachers", {}) or {}, "detector", {}) or {}
         self.det_every_n = int(_get(det_cfg, "every_n", 1) or 1)
 
+        # perceptual weighting toggles (backward-compatible defaults)
+        self.csf_freq = bool(_get(loss_cfg, "csf_freq", True))   # CSF-weight L_freq
+        self.jnd_rec = bool(_get(loss_cfg, "jnd_rec", True))     # JND-weight L_rec
+        self.jnd_scale = float(_get(loss_cfg, "jnd_scale", 1.0))
+
         # tunables (not part of the frozen contract; kept as attributes)
         self.charb_eps = 1e-3
         self.conf_eps = 1e-4
@@ -44,6 +49,7 @@ class PharosLoss:
         self.depth_lowres = 64
         self.eps = 1e-8
         self._det_counter = 0
+        self._csf_cache: dict[tuple[int, int], torch.Tensor] = {}
 
     # ------------------------------------------------------------------
     def __call__(
@@ -70,19 +76,45 @@ class PharosLoss:
         return total, log
 
     # ------------------------------------------------------------------
-    # L_rec — Charbonnier(J, GT)
+    # L_rec — Charbonnier(J, GT), optionally JND-weighted (w = 1/(1 + jnd_scale·JND)).
     def _rec(self, out: PharosOutput, clean: Optional[torch.Tensor], device) -> torch.Tensor:
         if clean is None:
             return _z(device)
+        if self.jnd_rec:
+            w = _jnd_weight(clean, self.jnd_scale)
+            return _weighted_charbonnier(out.output, clean, w, self.charb_eps)
         return _charbonnier(out.output, clean, self.charb_eps)
 
-    # L_freq — L1 on FFT amplitude
+    # L_freq — L1 on FFT amplitude, optionally CSF-weighted (peaks at mid frequencies).
     def _freq(self, out: PharosOutput, clean: Optional[torch.Tensor], device) -> torch.Tensor:
         if clean is None:
             return _z(device)
         fo = torch.fft.rfft2(out.output.float(), dim=(-2, -1))
         fc = torch.fft.rfft2(clean.float(), dim=(-2, -1))
-        return (fo.abs() - fc.abs()).abs().mean()
+        diff = (fo.abs() - fc.abs()).abs()
+        if self.csf_freq:
+            diff = diff * self._csf_mask(diff.shape[-2], int(out.output.shape[-1]), device, diff.dtype)
+        return diff.mean()
+
+    def _csf_mask(self, h: int, w: int, device, dtype) -> torch.Tensor:
+        """Radial Mannos-Sakrison CSF mask over the rfft2 grid, shape (1,1,H,W//2+1).
+
+        Peaks at mid frequencies (~8 cyc/deg equiv.), normalized to a max of 1 and
+        cached per (H, W). Down-weights DC/low and very-high frequencies where the
+        human visual system is least sensitive.
+        """
+        key = (h, w)
+        m = self._csf_cache.get(key)
+        if m is None:
+            fy = torch.fft.fftfreq(h).view(h, 1)          # cyc/pixel in [-0.5, 0.5)
+            fx = torch.fft.rfftfreq(w).view(1, -1)         # cyc/pixel in [0, 0.5]
+            radial = torch.sqrt(fy * fy + fx * fx) / 0.5   # axis-Nyquist -> 1.0
+            cpd = radial * _CSF_NYQUIST_CPD                 # -> cycles/degree
+            b = 0.114
+            csf = 2.6 * (0.0192 + b * cpd) * torch.exp(-((b * cpd) ** 1.1))
+            m = (csf / csf.max().clamp_min(1e-8)).view(1, 1, h, fx.numel())
+            self._csf_cache[key] = m
+        return m.to(device=device, dtype=dtype)
 
     # L_conf — heteroscedastic Laplace NLL on the predicted log-variance:
     #   sigma = exp(logvar),  NLL = |err|/sigma + log sigma = |err|·exp(−lv) + lv.
@@ -212,16 +244,18 @@ class PharosLoss:
             loss = loss + photo / max(t - 1, 1)
         return loss
 
-    # L_phys — supervised beta/airlight/sigma (L1) + domain (CE), when present.
-    # Clip batches arrive time-stacked from the engine (deg values B,T,k,
-    # domain_logits B,T,3); per-sample targets apply to every frame.
+    # L_phys — supervised beta/beta_bs/airlight/sigma (L1) + domain (CE), when present.
+    # beta_bs (split backscatter coeff) is supervised exactly like beta and skipped
+    # cleanly if either the deg head or the meta omits it. Clip batches arrive
+    # time-stacked from the engine (deg values B,T,k, domain_logits B,T,3);
+    # per-sample targets apply to every frame.
     def _phys(self, out: PharosOutput, batch: dict, device) -> torch.Tensor:
         deg = out.deg or {}
         meta = batch.get("meta") or {}
         loss = _z(device)
         found = False
 
-        for key in ("beta", "airlight", "sigma"):
+        for key in ("beta", "beta_bs", "airlight", "sigma"):
             pred = _get(deg, key, None)
             if pred is None:
                 continue
@@ -257,6 +291,82 @@ def _z(device) -> torch.Tensor:
 
 def _charbonnier(x: torch.Tensor, y: torch.Tensor, eps: float) -> torch.Tensor:
     return torch.sqrt((x - y) ** 2 + eps * eps).mean()
+
+
+def _weighted_charbonnier(x: torch.Tensor, y: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+    """Per-pixel-weighted Charbonnier; ``w`` broadcasts over the channel dim."""
+    return (w * torch.sqrt((x - y) ** 2 + eps * eps)).mean()
+
+
+# --- CSF (item 3) ----------------------------------------------------------
+# cycles/degree at axis-Nyquist; places the Mannos-Sakrison peak (~8 c/deg) at
+# mid radial frequency (normalized radius ~0.5).
+_CSF_NYQUIST_CPD = 16.0
+
+
+# --- JND (item 4) ----------------------------------------------------------
+# Chou-Li (1995) spatial-domain JND: background luminance low-pass (B/32) and four
+# directional gradient operators (grad/16); mg = max_k |grad_k|. Closed-form, no
+# learned params. Kernels live at module scope so they are built once.
+_JND_BG = torch.tensor(
+    [[1, 1, 1, 1, 1], [1, 2, 2, 2, 1], [1, 2, 0, 2, 1], [1, 2, 2, 2, 1], [1, 1, 1, 1, 1]],
+    dtype=torch.float32,
+) / 32.0
+_JND_G = torch.stack([
+    torch.tensor([[0, 0, 0, 0, 0], [1, 3, 8, 3, 1], [0, 0, 0, 0, 0], [-1, -3, -8, -3, -1],
+                  [0, 0, 0, 0, 0]], dtype=torch.float32),
+    torch.tensor([[0, 0, 1, 0, 0], [0, 8, 3, 0, 0], [1, 3, 0, -3, -1], [0, 0, -3, -8, 0],
+                  [0, 0, -1, 0, 0]], dtype=torch.float32),
+    torch.tensor([[0, 0, 1, 0, 0], [0, 0, 3, 8, 0], [-1, -3, 0, 3, 1], [0, -8, -3, 0, 0],
+                  [0, 0, -1, 0, 0]], dtype=torch.float32),
+    torch.tensor([[0, 1, 0, -1, 0], [0, 3, 0, -3, 0], [0, 8, 0, -8, 0], [0, 3, 0, -3, 0],
+                  [0, 1, 0, -1, 0]], dtype=torch.float32),
+]) / 16.0
+
+
+def _chou_li_jnd(lum: torch.Tensor) -> torch.Tensor:
+    """Chou-Li spatial JND map from luminance in [0,255] (B,1,H,W) -> B,1,H,W.
+
+    JND = max(luminance-contrast masking, background luminance adaptation). Higher
+    where the eye tolerates more error (busy texture, very dark/bright regions).
+    """
+    dev, dt = lum.device, lum.dtype
+    pad = F.pad(lum, (2, 2, 2, 2), mode="reflect")
+    bg = F.conv2d(pad, _JND_BG.view(1, 1, 5, 5).to(dev, dt))
+    grad = F.conv2d(pad, _JND_G.view(4, 1, 5, 5).to(dev, dt))
+    mg = grad.abs().amax(dim=1, keepdim=True)
+    masking = mg * (bg * 0.0001 + 0.115) + (0.5 - bg * 0.01)
+    lum_adapt = torch.where(
+        bg <= 127.0,
+        17.0 * (1.0 - (bg.clamp_min(0.0) / 127.0).sqrt()) + 3.0,
+        (3.0 / 128.0) * (bg - 127.0) + 3.0,
+    )
+    return torch.maximum(masking, lum_adapt)
+
+
+def _jnd_weight(clean: torch.Tensor, jnd_scale: float) -> torch.Tensor:
+    """Per-pixel reconstruction weight ``w = 1/(1 + jnd_scale·JND_norm)`` from GT.
+
+    JND is min-max normalized per sample to [0,1] so ``w`` lands in
+    [1/(1+jnd_scale), 1] (textured/less-sensitive pixels weighted down). Handles
+    both 4D (B,3,H,W) and 5D clip (B,T,3,H,W) tensors; returns a matching 1-channel
+    weight. Degrades to ~uniform (plain Charbonnier) on flat images.
+    """
+    x = clean
+    lead = None
+    if x.dim() == 5:
+        lead = x.shape[:2]
+        x = x.flatten(0, 1)
+    lum = (0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]) * 255.0
+    jnd = _chou_li_jnd(lum)
+    flat = jnd.flatten(1)
+    lo = flat.min(dim=1).values.view(-1, 1, 1, 1)
+    hi = flat.max(dim=1).values.view(-1, 1, 1, 1)
+    jnd_n = (jnd - lo) / (hi - lo + 1e-6)
+    w = 1.0 / (1.0 + jnd_scale * jnd_n)
+    if lead is not None:
+        w = w.view(lead[0], lead[1], 1, *w.shape[-2:])
+    return w
 
 
 def _l2norm_rows(x: torch.Tensor, eps: float) -> torch.Tensor:
