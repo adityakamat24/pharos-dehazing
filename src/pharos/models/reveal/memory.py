@@ -183,6 +183,14 @@ class RevealMemory:
         """Compose the aligner's frame-to-frame ``h_t`` (cur<-prev) into cumulative ``H``."""
         self.H = (h_t.to(torch.float32) @ self.H).contiguous()
 
+    def set_cumulative(self, h_cum: torch.Tensor) -> None:
+        """Set ``H`` (cur<-anchor) directly from a track-to-keyframe estimate.
+
+        Unlike :meth:`compose`, per-frame estimation errors do not accumulate:
+        each registration is absolute w.r.t. the anchor-epoch keyframe.
+        """
+        self.H = h_cum.to(torch.float32).contiguous()
+
     def warp(self, homography: torch.Tensor) -> None:
         """Resample the whole buffer by ``homography`` (anchor->current) in place.
 

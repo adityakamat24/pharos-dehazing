@@ -106,11 +106,25 @@ class RevealNet(nn.Module):
             memory = RevealMemory.seed(j_mid, self.seed_trust, margin=self.anchor_margin)
             align_full = torch.zeros_like(conf)
             homog = None
+            keyframe = cur_lr
         else:
             memory: RevealMemory = state["memory"]
-            homog, tmap, scalar = self.aligner(cur_lr, state["anchor"], motion_prior)
-            memory.compose(homog)                                  # cumulative anchor->current
+            keyframe = state.get("keyframe", state["anchor"])
+            # Track-to-KEYFRAME: estimate the cumulative anchor->current homography
+            # directly against the anchor-epoch keyframe. Per-step errors do not
+            # compose (frame-to-frame odometry drift measurably killed T=32 recall:
+            # -1.5 dB with a proven-exact memory).
+            h_cum, tmap, scalar = self.aligner(cur_lr, keyframe, motion_prior)
+            prev_cum = memory.H.detach()
+            memory.set_cumulative(h_cum)
             reanchors = memory.maybe_reanchor(self.cfg, scalar)    # rare single-resample rebase
+            if reanchors:
+                keyframe = cur_lr                                  # new anchor epoch
+            # expose the frame-to-frame equivalent for L_align supervision
+            # (loss compares against relative GT warps): H_t = H_cum @ inv(H_prev_cum).
+            homog = h_cum @ torch.linalg.inv(
+                prev_cum.float() + 1e-8 * torch.eye(3, device=prev_cum.device)
+            ).to(h_cum.dtype)
             align_mid = self._resize(tmap, (mh, mw)) * scalar.view(-1, 1, 1, 1)
             memory.update(j_mid, conf_mid, align_mid, self.cfg, dt=self.dt)
             align_full = self._resize(tmap * scalar.view(-1, 1, 1, 1), (h, w))
@@ -128,7 +142,8 @@ class RevealNet(nn.Module):
         )  # aux stat: re-anchor count this frame (per-batch scalar)
         if homog is not None:
             aux["align_H"] = homog  # estimated 3x3 homography (RevealLoss L_align supervision)
-        new_state = {"inner": inner_out.state, "memory": memory, "anchor": cur_lr}
+        new_state = {"inner": inner_out.state, "memory": memory, "anchor": cur_lr,
+                     "keyframe": keyframe}
         return PharosOutput(
             output=out,
             confidence=conf,
