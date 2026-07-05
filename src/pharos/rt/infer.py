@@ -219,11 +219,17 @@ class StreamingRestorer:
         fps_window: int = 30,
         auto_scene_cut: bool = False,
         scene_cut_thresh: float = 0.5,
+        photography: bool = False,
     ) -> None:
         self.device = _resolve_device(device)
         self.pad_multiple = int(pad_multiple)
         self.gate_lo = float((gate or {}).get("beta_lo", 0.15))
         self.gate_hi = float((gate or {}).get("beta_hi", 0.45))
+        # Photography mode: use the PRE-GATE restoration (aux "j"). The severity
+        # gate exists for the safety path; vivid-trained weights can drift the
+        # degradation estimate low enough to close it and discard a strong
+        # restoration (measured). Photo mode wants the full restoration always.
+        self.photography = bool(photography)
         self.auto_scene_cut = auto_scene_cut
         self.scene_cut_thresh = float(scene_cut_thresh)
 
@@ -328,7 +334,10 @@ class StreamingRestorer:
         self._sync()
         t2 = perf_counter()
 
-        output_bgr = tensor_to_bgr(out.output, orig_hw)
+        out_t = out.output
+        if self.photography and isinstance(out.aux, dict) and out.aux.get("j") is not None:
+            out_t = out.aux["j"]
+        output_bgr = tensor_to_bgr(out_t, orig_hw)
         confidence = confidence_to_map(out.confidence, orig_hw)
         deg = self._unpack_deg(out.deg)
         t3 = perf_counter()
