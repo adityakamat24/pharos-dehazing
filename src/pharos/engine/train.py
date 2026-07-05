@@ -522,9 +522,27 @@ class Trainer:
             warnings.warn(f"resume_weights_only requested but no checkpoint at {path}")
             return
         ck = load_checkpoint(path, map_location=self.device)
-        self.model.load_state_dict(ck["model"], strict=True)
+        # Tolerant load: architecture extensions (e.g. a new deg-head output conv)
+        # add keys an older checkpoint cannot have; those stay freshly initialized.
+        # Guard against loading a wholly wrong checkpoint (rt.load_model pattern).
+        missing, unexpected = self.model.load_state_dict(ck["model"], strict=False)
+        n_keys = len(self.model.state_dict())
+        if missing and len(missing) > n_keys // 2:
+            raise ValueError(
+                f"resume_weights_only: {len(missing)}/{n_keys} keys missing from {path} — wrong checkpoint?"
+            )
+        if missing or unexpected:
+            warnings.warn(
+                f"resume_weights_only: {len(missing)} new keys fresh-initialized, "
+                f"{len(unexpected)} checkpoint keys ignored"
+            )
         if ck.get("ema") and getattr(self.ema, "load_state_dict", None):
-            self.ema.load_state_dict(ck["ema"])
+            ema_sd = dict(ck["ema"])
+            shadow = dict(getattr(self.ema, "shadow", {}))
+            # merge: keep fresh-model values for keys the old shadow lacks
+            shadow.update(ema_sd.get("shadow", {}))
+            ema_sd["shadow"] = shadow
+            self.ema.load_state_dict(ema_sd)
         print(f"initialized weights (+EMA) from {path}; fresh schedule at step 0")
 
 
