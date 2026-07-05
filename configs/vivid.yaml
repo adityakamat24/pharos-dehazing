@@ -1,0 +1,57 @@
+# Vivid mode (DESIGN.md N4, PHOTOGRAPHY-mode variant): a perceptual/adversarial
+# polish stage on top of the stage-2 fine-tuned PharosNet. The deployed network
+# and its inference cost are unchanged — vivid is just a different set of weights.
+# Goal: dramatically crisper, more natural restorations, killing the muddy/blotchy
+# amplified-noise regions where haze/smoke was dense. The base (safety) model stays
+# untouched; this trains a separate checkpoint.
+#
+# Launch with scripts/train_vivid.py — it injects PharosNet + VividLoss through the
+# WS-D Trainer's Deps seam. The engine is UNCHANGED: VividLoss self-manages the
+# discriminator and its own optimizer, and updates D inside its own __call__.
+#
+# Init from the fine-tuned checkpoint (weights only -> fresh 20k schedule). On the
+# pod it lives at /workspace/runs/finetune_real/ckpt/last.pt; enable ONE at launch:
+#   --override train.resume_weights_only=/workspace/runs/finetune_real/ckpt/last.pt
+#   --override model.vivid_init=/workspace/runs/finetune_real/ckpt/last.pt
+# (resume_weights_only = engine path; model.vivid_init = launcher path, EMA-aware.)
+_base_: base.yaml
+exp_name: vivid
+
+train:
+  crop: 256
+  batch: 10
+  lr: 1.0e-5             # gentle: polishing, not relearning
+  weight_decay: 0.01
+  iters: 20000
+  warmup_iters: 500
+  clip_period: 50        # image-dominant: clips only rarely (vivid polish is image-first)
+  ema: 0.999
+  ckpt_every: 2000
+  eval_every: 5000
+  num_workers: 4
+  channels_last: true
+  # resume_weights_only: /workspace/runs/finetune_real/ckpt/last.pt  # (pod) init from fine-tune
+
+loss:
+  vivid:
+    l1: 1.0             # Charbonnier anchor (keep 1.0)
+    lpips: 0.3          # perceptual sharpness
+    gan: 0.02           # adversarial "wow" (ramped in over gan_warmup)
+    conf: 0.05          # recalibrate the confidence head to the NEW error profile
+    gan_warmup: 2000    # steps to ramp w_gan 0 -> target
+    disc_lr: 1.0e-4     # discriminator Adam lr (self-managed inside VividLoss)
+    # disc: {type: patch, base_ch: 64, n_layers: 3, max_ch: 256}  # or type: unet
+
+datasets:
+  # Real + synthetic mix copied from finetune_real.yaml (not imported), with the
+  # NTIRE index split so vivid never trains on the benchmark images.
+  ntire_split: true
+  train:
+    - nhhaze            # real paired (train split)
+    - densehaze         # real paired
+    - ohaze             # real paired
+    - ihaze             # real paired
+    - reside6k          # synthetic base (anti-forgetting)
+    - smokebench        # real fire smoke
+    - synth_smoke       # synthetic smoke
+    - clear_passthrough # identity targets (severity-gate no-harm)
