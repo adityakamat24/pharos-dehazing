@@ -52,10 +52,17 @@ class VividLoss:
         self.relativistic = bool(_get(vivid, "relativistic", False))
         self.lpips_net = str(_get(vivid, "lpips_net", "alex"))
         self.charb_eps = 1e-3
+        # Conditional (pix2pix-style) D: judges (input, output) PAIRS. An
+        # unconditional D cannot distinguish haze from natural atmosphere, so
+        # near-passthrough of a hazy input scores as 'real' and the generator
+        # learns to under-dehaze (observed on NH-HAZE with the v1 vivid run).
+        self.conditional = bool(_get(vivid, "conditional", True))
 
         # Discriminator + its OWN optimizer (engine never sees these). Adam betas
         # (0.5, 0.999) are the DCGAN/pix2pix default for adversarial stability.
-        disc_cfg = _get(vivid, "disc", {}) or {}
+        disc_cfg = dict(_get(vivid, "disc", {}) or {})
+        if self.conditional:
+            disc_cfg.setdefault("in_ch", 6)
         self.disc = disc if disc is not None else build_discriminator(disc_cfg)
         self.d_opt = torch.optim.Adam(self.disc.parameters(), lr=self.disc_lr, betas=(0.5, 0.999))
 
@@ -79,15 +86,22 @@ class VividLoss:
 
         out_last, clean_last, logvar_last = self._reduce_last(out, batch.get("clean"))
         have_pair = clean_last is not None
+        hazy = batch.get("hazy")
+        cond = None
+        if self.conditional and torch.is_tensor(hazy):
+            cond = (hazy[:, -1] if hazy.dim() == 5 else hazy).to(device)
+            if cond.shape[-2:] != out_last.shape[-2:]:
+                cond = F.interpolate(cond, size=out_last.shape[-2:], mode="bilinear",
+                                     align_corners=False)
 
         # (1) discriminator step — self-managed, fp32, autocast OFF for stability.
-        d_val = self._update_disc(out_last, clean_last, device) if have_pair else 0.0
+        d_val = self._update_disc(out_last, clean_last, cond, device) if have_pair else 0.0
 
         # (2) generator-side total.
         w_gan = self.w["gan"] * self._warmup_factor()
         l1 = self._l1(out_last, clean_last, device)
         lpips_v = self._lpips_term(out_last, clean_last, device)
-        gan = self._gen_gan(out_last, clean_last, device) if (have_pair and w_gan > 0.0) else _z(device)
+        gan = self._gen_gan(out_last, clean_last, cond, device) if (have_pair and w_gan > 0.0) else _z(device)
         conf = self._conf_term(out, out_last, clean_last, logvar_last, device)
 
         total = self.w["l1"] * l1 + self.w["lpips"] * lpips_v + w_gan * gan + self.w["conf"] * conf
@@ -111,12 +125,17 @@ class VividLoss:
         return min(1.0, self._step / float(self.gan_warmup))
 
     # ------------------------------------------------------------ D update
-    def _update_disc(self, fake: torch.Tensor, real: torch.Tensor, device) -> float:
+    def _update_disc(self, fake: torch.Tensor, real: torch.Tensor,
+                     cond: Optional[torch.Tensor], device) -> float:
         """One hinge step on the discriminator (own optimizer, fp32, no scaler)."""
         dev_type = device.type if hasattr(device, "type") else "cpu"
         with torch.autocast(device_type=dev_type, enabled=False):
             real_f = real.detach().float()
             fake_f = fake.detach().float()
+            if cond is not None:
+                c = cond.detach().float()
+                real_f = torch.cat([c, real_f], dim=1)
+                fake_f = torch.cat([c, fake_f], dim=1)
             d_real = self.disc(real_f)
             d_fake = self.disc(fake_f)
             if self.relativistic:  # relativistic-average hinge
@@ -132,15 +151,22 @@ class VividLoss:
         return float(d_loss.detach())
 
     # -------------------------------------------------------- generator GAN
-    def _gen_gan(self, fake: torch.Tensor, clean_last: Optional[torch.Tensor], device) -> torch.Tensor:
+    def _gen_gan(self, fake: torch.Tensor, clean_last: Optional[torch.Tensor],
+                 cond: Optional[torch.Tensor], device) -> torch.Tensor:
         """Generator hinge on D(J). D params are frozen so the engine's backward
         (which runs over the returned total) does not accumulate grads on them."""
         for p in self.disc.parameters():
             p.requires_grad_(False)
         try:
+            if cond is not None:
+                c = cond.detach()
+                fake = torch.cat([c.to(fake.dtype), fake], dim=1)
             d_fake = self.disc(fake)
             if self.relativistic and clean_last is not None:
-                d_real = self.disc(clean_last.detach()).detach()
+                real_in = clean_last.detach()
+                if cond is not None:
+                    real_in = torch.cat([cond.detach().to(real_in.dtype), real_in], dim=1)
+                d_real = self.disc(real_in).detach()
                 g = (
                     F.relu(1.0 - (d_fake - d_real.mean())).mean()
                     + F.relu(1.0 + (d_real - d_fake.mean())).mean()
