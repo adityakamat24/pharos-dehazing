@@ -268,6 +268,7 @@ class SyntheticDataset(_PharosDataset):
         robustness: RobustnessPipeline | None = None,
         depth_dir: str | Path | None = None,
         name: str | None = None,
+        synth_kwargs: dict | None = None,
     ) -> None:
         if isinstance(domain, str):
             domain_id = {v: k for k, v in DOMAIN_NAMES.items()}[domain]
@@ -279,6 +280,7 @@ class SyntheticDataset(_PharosDataset):
         self.name = name or f"synth_{self.domain_name}"
         self.robustness = robustness
         self.depth_dir = Path(depth_dir) if depth_dir else None
+        self.synth_kwargs = synth_kwargs or {}
         lister = list_images_recursive if recursive else list_images
         self.files = lister(clean_dir)
 
@@ -299,13 +301,16 @@ class SyntheticDataset(_PharosDataset):
         clean = load_image(cp)
         g = self._gen(idx)
         depth = self._load_depth(cp) if self.domain == DOMAIN_HAZE else None
-        hazy, params = synthesis.synthesize(clean, self.domain_name, generator=g, depth=depth)
+        hazy, params = synthesis.synthesize(
+            clean, self.domain_name, generator=g, depth=depth, **self.synth_kwargs
+        )
         if self.robustness is not None:
             hazy = self.robustness(hazy, g)
         meta = {
             "dataset": self.name,
             "clean_path": str(cp),
             "beta": torch.tensor([params["beta"]], dtype=torch.float32),
+            "beta_bs": torch.tensor([params.get("beta_bs", params["beta"])], dtype=torch.float32),
             "airlight": params["airlight"].float(),
             "sigma": torch.tensor([params["sigma"]], dtype=torch.float32),
             "synthetic": True,
@@ -468,11 +473,17 @@ class SynthVideoDataset(_PharosDataset):
         seed: int | None = None,
         robustness: RobustnessPipeline | None = None,
         name: str = "synth_video",
+        synth_kwargs: dict | None = None,
     ) -> None:
         self.clip_len = clip_len
         self.domains = list(domains)
         self.crop, self.augment, self.lowres, self.seed, self.name = crop, augment, lowres, seed, name
         self.robustness = robustness
+        # synthesize_clip only accepts the temporal-relevant knobs
+        self.synth_kwargs = {
+            k: v for k, v in (synth_kwargs or {}).items()
+            if k in ("smoke_mode", "isp_aware", "beta_bs_ratio")
+        }
         self.seqs = _discover_sequences(clean_root)
         if self.seqs:
             self.stills: list[Path] = []
@@ -499,13 +510,14 @@ class SynthVideoDataset(_PharosDataset):
         g = self._gen(idx)
         clean = self._clean_clip(si, start)
         domain = self.domains[idx % len(self.domains)]
-        hazy, params = synthesis.synthesize_clip(clean, domain, generator=g)
+        hazy, params = synthesis.synthesize_clip(clean, domain, generator=g, **self.synth_kwargs)
         if self.robustness is not None:
             hazy = torch.stack([self.robustness(hazy[i], g) for i in range(hazy.shape[0])])
         dom_id = {v: k for k, v in DOMAIN_NAMES.items()}[domain]
         meta = {
             "dataset": self.name,
             "beta": torch.tensor([params["beta"]], dtype=torch.float32),
+            "beta_bs": torch.tensor([params.get("beta_bs", params["beta"])], dtype=torch.float32),
             "airlight": params["airlight"].float(),
             "sigma": torch.tensor([params.get("sigma", 0.0)], dtype=torch.float32),
             "synthetic": True,
@@ -654,6 +666,16 @@ def _cfg_get(cfg: Any, dotted: str, default: Any) -> Any:
     return node
 
 
+def _synth_kwargs(cfg: Any) -> dict:
+    """Extract the ``synthesis`` config block (turbulent smoke / ISP-aware haze /
+    split-beta knobs) as kwargs to splat into synthesis.synthesize(_clip)."""
+    s = _cfg_get(cfg, "synthesis", {}) or {}
+    if not isinstance(s, dict):
+        return {}
+    keys = ("smoke_mode", "isp_aware", "beta_bs_ratio", "isp_gamma", "shot_photons")
+    return {k: s[k] for k in keys if k in s}
+
+
 class _RobustView(Dataset):
     """Substitute a neighboring sample when a file is unreadable.
 
@@ -780,7 +802,7 @@ def _build_dataset_impl(name: str, cfg: Any, split: str = "train") -> Dataset:
         return SyntheticDataset(
             clean_pool, domain=domain_name, crop=use_crop, augment=augment, lowres=lowres,
             seed=seed, robustness=robustness, depth_dir=depth_dir if depth_dir.is_dir() else None,
-            name=name,
+            name=name, synth_kwargs=_synth_kwargs(cfg),
         )
 
     if name == "clear_passthrough":
@@ -818,7 +840,7 @@ def _build_dataset_impl(name: str, cfg: Any, split: str = "train") -> Dataset:
         robustness = RobustnessPipeline() if is_train else None
         return SynthVideoDataset(
             clean_root, clip_len=clip_len, crop=use_crop, augment=augment, lowres=lowres,
-            seed=seed, robustness=robustness, name="synth_video",
+            seed=seed, robustness=robustness, name="synth_video", synth_kwargs=_synth_kwargs(cfg),
         )
 
     raise ValueError(f"unknown dataset name: {name!r}")

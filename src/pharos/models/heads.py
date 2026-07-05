@@ -18,11 +18,19 @@ from .blocks import RepConv
 class DegradationHead(nn.Module):
     """Pooled features -> continuous degradation estimate + FiLM conditioning.
 
-    beta (density) and sigma (non-homogeneity) use softplus (>=0); airlight uses
+    beta (attenuation) and sigma (non-homogeneity) use softplus (>=0); beta_bs
+    (Sea-thru backscatter/airlight-build-up coeff) uses softplus too; airlight uses
     sigmoid (RGB color in [0,1]); domain_logits are raw (softmax at loss time).
     The conditioning vector concatenates a learned embedding with the estimated
     physical quantities and a small domain embedding (DESIGN: continuous, not a
     discrete classifier). Its width is exposed as `cond_dim` for the FiLM modules.
+
+    ``head_beta_bs`` is a *separate* small head added after the original ones so old
+    checkpoints load exactly (their keys are unchanged; the new head is init'd fresh
+    and appears only in ``missing_keys`` under a strict=False load). beta_bs is
+    intentionally NOT appended to the conditioning vector: doing so would change
+    ``cond_dim`` and thus the FiLM weight shapes, breaking PharosNet checkpoint
+    compat. Wiring beta_bs into FiLM is left as a followup (see report).
     """
 
     def __init__(self, in_ch: int, hidden: int = 128, embed: int = 32, domain_embed: int = 8) -> None:
@@ -37,6 +45,8 @@ class DegradationHead(nn.Module):
         self.embed = nn.Linear(hidden, embed)
         self.domain_embed = nn.Linear(3, domain_embed)
         self.cond_dim = embed + 1 + 3 + 1 + domain_embed
+        # separate head (keeps old checkpoints loadable); appended after the rest.
+        self.head_beta_bs = nn.Linear(hidden, 1)
 
     def forward(self, feat: torch.Tensor) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         v = F.adaptive_avg_pool2d(feat, 1).flatten(1)
@@ -45,10 +55,14 @@ class DegradationHead(nn.Module):
         airlight = torch.sigmoid(self.head_air(h))
         sigma = F.softplus(self.head_sigma(h))
         domain_logits = self.head_domain(h)
+        beta_bs = F.softplus(self.head_beta_bs(h))
         cond = torch.cat(
             [self.embed(h), beta, airlight, sigma, self.domain_embed(domain_logits)], dim=1
         )
-        deg = {"beta": beta, "airlight": airlight, "sigma": sigma, "domain_logits": domain_logits}
+        deg = {
+            "beta": beta, "beta_bs": beta_bs, "airlight": airlight,
+            "sigma": sigma, "domain_logits": domain_logits,
+        }
         return deg, cond
 
 

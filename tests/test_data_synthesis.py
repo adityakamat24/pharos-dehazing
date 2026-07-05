@@ -163,3 +163,92 @@ def test_synthesize_clip_reproducible():
     a, _ = S.synthesize_clip(frames, "smoke", generator=_gen(7))
     b, _ = S.synthesize_clip(frames, "smoke", generator=_gen(7))
     assert torch.allclose(a, b)
+
+
+# ---------------------------------------------------------------------------
+# item 1 — turbulent source-point smoke
+# ---------------------------------------------------------------------------
+def test_turbulent_density_deterministic_and_range():
+    a = S.turbulent_density(48, 64, generator=_gen(3))
+    b = S.turbulent_density(48, 64, generator=_gen(3))
+    assert a.shape == (48, 64)
+    assert torch.allclose(a, b)  # deterministic under the generator
+    assert float(a.min()) >= 0.0 and float(a.max()) <= 1.0
+    # differs from a Perlin field of the same size (genuinely a different process)
+    perlin = S.fractal_noise(48, 64, octaves=4, generator=_gen(3))
+    assert not torch.allclose(a, perlin)
+
+
+def test_turbulent_smoke_deterministic():
+    clean = _clean()
+    a, pa = S.smoke(clean, generator=_gen(4), smoke_mode="turbulent", fire_glow=False)
+    b, pb = S.smoke(clean, generator=_gen(4), smoke_mode="turbulent", fire_glow=False)
+    assert torch.allclose(a, b)
+    assert pa["smoke_mode"] == "turbulent" and float(a.min()) >= 0.0 and float(a.max()) <= 1.0
+
+
+def test_turbulent_density_stats_match_perlin():
+    # moment-matched turbulent density should share the Perlin path's sigma statistics
+    clean = _clean()
+    per = [S.smoke(clean, generator=_gen(s), smoke_mode="perlin")[1]["sigma"] for s in range(30)]
+    tur = [S.smoke(clean, generator=_gen(s + 500), smoke_mode="turbulent")[1]["sigma"] for s in range(30)]
+    mp, mt = sum(per) / len(per), sum(tur) / len(tur)
+    assert abs(mp - mt) < 0.05, (mp, mt)  # means close -> same downstream distribution
+
+
+def test_smoke_mode_mix_picks_both():
+    clean = _clean()
+    modes = {S.smoke(clean, generator=_gen(s), smoke_mode="mix")[1]["smoke_mode"] for s in range(20)}
+    assert modes == {"perlin", "turbulent"}  # mix yields both across seeds
+
+
+def test_turbulent_clip_temporally_coherent():
+    frame = _clean(48, 64)
+    frames = frame.unsqueeze(0).repeat(6, 1, 1, 1)
+    clip, _ = S.synthesize_clip(frames, "smoke", generator=_gen(1), smoke_mode="turbulent")
+    assert clip.shape == frames.shape
+    adj = (clip[1:] - clip[:-1]).abs().mean()
+    assert float(adj) < 0.05  # advection advances gently between frames
+
+
+# ---------------------------------------------------------------------------
+# item 2 — ISP-aware haze composition
+# ---------------------------------------------------------------------------
+def test_isp_aware_backward_compat_when_off():
+    # isp_aware=False must reproduce the exact legacy ASM (same generator stream).
+    clean = _clean()
+    depth = torch.rand(1, 48, 64, generator=_gen(9))
+    a, pa = S.ground_haze(clean, depth=depth, generator=_gen(0), isp_aware=False)
+    # legacy single-beta ASM reconstructed by hand
+    d = S._prep_depth(depth, 48, 64, clean.device)
+    t = torch.exp(-pa["beta"] * d)
+    air = pa["airlight"].view(3, 1, 1)
+    manual = (clean * t + air * (1 - t)).clamp(0, 1)
+    assert torch.allclose(a, manual, atol=1e-6)
+    assert abs(pa["beta_bs"] - pa["beta"]) < 1e-12  # coincide when off
+
+
+def test_isp_aware_outputs_finite_and_in_range():
+    clean = _clean()
+    for seed in range(5):
+        hazy, p = S.ground_haze(clean, generator=_gen(seed), isp_aware=True)
+        assert torch.isfinite(hazy).all()
+        assert float(hazy.min()) >= 0.0 and float(hazy.max()) <= 1.0
+        assert "beta_bs" in p
+
+
+def test_isp_aware_injects_shot_noise_in_flat_foggy_region():
+    # a uniform scene + uniform depth -> legacy ASM is perfectly flat; ISP shot noise
+    # (dominant in low-contrast/foggy regions) must inject visible spatial variance.
+    clean = torch.full((3, 40, 40), 0.35)
+    depth = torch.ones(1, 40, 40) * 0.9  # deep -> foggy
+    off, _ = S.ground_haze(clean, depth=depth, generator=_gen(2), isp_aware=False, beta=2.0)
+    on, _ = S.ground_haze(clean, depth=depth, generator=_gen(2), isp_aware=True, beta=2.0)
+    assert float(off.std()) < 1e-6           # legacy path is flat
+    assert float(on.std()) > 10 * (float(off.std()) + 1e-6)  # noise present when on
+
+
+def test_split_beta_bs_differs_in_isp_mode():
+    clean = _clean()
+    _, p = S.ground_haze(clean, generator=_gen(1), isp_aware=True)
+    assert abs(p["beta_bs"] - p["beta"]) > 1e-9  # backscatter beta perturbed under ISP
