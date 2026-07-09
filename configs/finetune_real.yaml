@@ -1,0 +1,35 @@
+# Stage-2 fine-tune on real haze (NTIRE-style): after the 100k synthetic-heavy
+# run, adapt on the small real paired sets (NH-HAZE, Dense-Haze, O-HAZE, I-HAZE
+# train splits) mixed with a slice of the original diet to avoid forgetting.
+# Expected effect: several dB on NH-HAZE/Dense-Haze at little cost elsewhere.
+#
+# datasets.ntire_split below activates the index split for the flat NTIRE sets
+# (train = all but last 5 pairs, eval = last 5) so fine-tuning never trains on
+# the benchmark images. Note stage-2 eval numbers for nhhaze/densehaze are on
+# the 5-pair held-out split (n=5), not directly comparable to stage-1 curves.
+_base_: pod_full.yaml
+exp_name: finetune_real
+
+train:
+  iters: 15000
+  warmup_iters: 500
+  lr: 5.0e-5            # gentle: adapting, not relearning
+  ema: 0.999
+  ckpt_every: 2500
+  eval_every: 5000
+  # weights-only: fresh 15k schedule (full resume would restore step=100k > 15k
+  # and exit immediately)
+  resume_weights_only: /workspace/runs/full/ckpt/last.pt
+
+datasets:
+  ntire_split: true
+  train:
+    - nhhaze            # 50 real pairs (train split)
+    - densehaze         # 50 real pairs
+    - ohaze             # 40 real pairs
+    - ihaze             # 25 real pairs
+    - reside6k          # retain synthetic base (anti-forgetting)
+    - smokebench
+    - synth_smoke
+    - clear_passthrough
+  train_video: [revide]

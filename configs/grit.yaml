@@ -1,0 +1,11 @@
+# "Grit" stage: vivid recipe + camera-realism degradations on REAL paired inputs.
+# Real deployment footage (CCTV smoke) carries JPEG/H.264 blocking and ISO noise
+# under the haze; training on clean-camera inputs makes the model amplify those
+# artifacts into mud (observed on SmokeBench scenes). This stage teaches
+# restore-through-compression. Launch with model.vivid_init pointing at the
+# vivid checkpoint (or the finetune checkpoint for a from-scratch polish).
+_base_: vivid.yaml
+exp_name: grit
+
+datasets:
+  robustness_real: true

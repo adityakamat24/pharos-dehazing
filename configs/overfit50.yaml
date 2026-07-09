@@ -1,0 +1,37 @@
+# Overfit sanity run: memorise a 50-image subset in 2k iters, eval on the train
+# set. If loss does not collapse and PSNR does not climb here, something is wrong
+# with the model/loss wiring before any real training. (DESIGN M4.)
+_base_: base.yaml
+exp_name: overfit50
+
+# Hint for WS-B loaders: cap the dataset to a tiny fixed subset. Loaders that do
+# not yet honour these keys simply train on the full set (still a valid sanity run).
+overfit: true
+data_subset: 50
+
+train:
+  crop: 256
+  batch: 8
+  iters: 2000
+  warmup_iters: 100
+  lr: 5.0e-4
+  amp: true
+  ema: 0.99
+  ckpt_every: 500
+  eval_every: 500
+  num_workers: 0        # Windows-safe: no worker processes for the tiny sanity run
+  grad_accum: 1
+  channels_last: false
+
+# Light teacher stack for the sanity run (depth prior only; detector/flow off to
+# save the 6 GB budget — training still runs with any subset disabled).
+teachers:
+  depth: {name: depth_anything_v2_small, enabled: true}
+  detector: {name: yolov8n, enabled: false, every_n: 4}
+  flow: {name: raft_small, enabled: false}
+
+datasets:
+  train: [reside6k]
+  train_video: []       # no temporal branch for the overfit sanity
+  eval: [reside6k]      # eval on the train subset by design
+  eval_noref: []

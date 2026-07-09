@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pharos"
+version = "0.1.0"
+description = "Real-time, confidence-aware, unified dehazing & desmoking with training-time-only foundation priors"
+requires-python = ">=3.11"
+dependencies = [
+    "torch",
+    "torchvision",
+    "numpy",
+    "pyyaml",
+    "opencv-python",
+    "tqdm",
+    "einops",
+]
+
+[project.optional-dependencies]
+train = ["tensorboard", "lpips", "timm", "requests", "gdown"]
+export = ["onnx", "onnxruntime-gpu"]
+dev = ["pytest", "ruff"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"

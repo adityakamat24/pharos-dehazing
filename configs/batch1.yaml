@@ -1,0 +1,24 @@
+# Batch-1 realism refresh: resume from the fine-tuned weights and retrain with
+# turbulent source-point smoke, ISP-aware haze, CSF/JND perceptual weighting,
+# split backscatter beta, and camera-realism degradations on real pairs — the
+# cross-domain research sweep's batch-1 items, all active at once.
+_base_: finetune_real.yaml
+exp_name: batch1
+
+train:
+  iters: 30000
+  lr: 1.0e-4
+
+datasets:
+  robustness_real: true
+  train:
+    - nhhaze
+    - densehaze
+    - ohaze
+    - ihaze
+    - reside6k
+    - smokebench
+    - synth_haze
+    - synth_smoke
+    - synth_satellite
+    - clear_passthrough
